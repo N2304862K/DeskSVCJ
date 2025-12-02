@@ -7,8 +7,9 @@
 #include <string.h>
 
 // Configuration
-#define DT (1.0/252.0)     // Daily Time Step
-#define NM_ITER 250        // Optimization Iterations
+#define DT (1.0/252.0)
+#define NM_ITER 350        // Increased iterations for convergence
+#define RESTARTS 2         // Optimizer restarts to escape local minima
 #define SQRT_2PI 2.50662827463
 
 // Data Indices
@@ -30,17 +31,13 @@ typedef struct {
     double sigma_j;
 } SVCJParams;
 
-// Core Functions
 void clean_returns(double* returns, int n);
 void compute_log_returns(double* ohlcv, int n_rows, double* out_returns);
 void check_constraints(SVCJParams* params);
 
-// Optimization
-void estimate_initial_params_ohlcv(double* ohlcv, int n, SVCJParams* p);
+void estimate_initial_params_smart(double* ohlcv, int n, SVCJParams* p); // Renamed
 void optimize_svcj(double* ohlcv, int n, SVCJParams* params, double* out_spot_vol, double* out_jump_prob);
 double ukf_log_likelihood(double* returns, int n, SVCJParams* params, double* out_spot_vol, double* out_jump_prob, double theta_anchor);
-
-// Pricing
 void price_option_chain(double s0, double* strikes, double* expiries, int* types, int n_opts, SVCJParams* params, double spot_vol, double* out_prices);
 
 #endif
