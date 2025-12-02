@@ -14,53 +14,55 @@ cdef extern from "svcj.h":
     void optimize_svcj(double* ohlcv, int n, SVCJParams* params, double* out_spot_vol, double* out_jump_prob) nogil
     void price_option_chain(double s0, double* strikes, double* expiries, int* types, int n_opts, SVCJParams* params, double spot_vol, double* out_prices) nogil
 
-# Helper: Ensure OHLCV is (N, 5) C-Contiguous
+# --- Helpers ---
+
 cdef np.ndarray[double, ndim=2, mode='c'] _sanitize_ohlcv(object input_data):
+    # Ensure input is 2D (Time, 5) float64 array
     cdef np.ndarray[double, ndim=2] arr = np.asarray(input_data, dtype=np.float64)
-    if arr.shape[1] != 5:
-        raise ValueError("Input must be OHLCV matrix with 5 columns")
+    if arr.ndim != 2 or arr.shape[1] != 5:
+        raise ValueError(f"Input must be OHLCV matrix (Time, 5). Got shape {arr.shape}")
     return np.ascontiguousarray(arr)
 
-# Helper: Process Option Chain to Columns
 cdef tuple _process_chain(object option_chain):
+    # Safe unpacking of option matrix
     cdef np.ndarray arr = np.asarray(option_chain, dtype=np.float64)
     if arr.ndim != 2 or arr.shape[1] < 4:
         raise ValueError("Option chain must be (N, 4) matrix: [Strike, Expiry, Type, Price]")
     
-    cdef np.ndarray[double, ndim=1, mode='c'] ks = np.ascontiguousarray(arr[:, 0])
-    cdef np.ndarray[double, ndim=1, mode='c'] ts = np.ascontiguousarray(arr[:, 1])
-    cdef np.ndarray[int, ndim=1, mode='c'] types = np.ascontiguousarray(arr[:, 2].astype(np.int32))
+    # FIX: Explicit ravel() to force 1D, prevents 'Buffer has wrong dimensions' error
+    cdef np.ndarray[double, ndim=1, mode='c'] ks = np.ascontiguousarray(arr[:, 0].ravel())
+    cdef np.ndarray[double, ndim=1, mode='c'] ts = np.ascontiguousarray(arr[:, 1].ravel())
+    cdef np.ndarray[int, ndim=1, mode='c'] types = np.ascontiguousarray(arr[:, 2].ravel().astype(np.int32))
+    
     return ks, ts, types, arr.shape[0]
 
 # --- Method 1: Asset-Specific Option Adjusted ---
 def generate_asset_option_adjusted(object ohlcv, double s0, object option_chain):
-    """
-    ohlcv: (N, 5) Matrix [Open, High, Low, Close, Volume]
-    option_chain: (M, 4) Matrix [Strike, T, Type, Price]
-    """
+    # 1. Prepare Data
     cdef np.ndarray[double, ndim=2, mode='c'] c_ohlcv = _sanitize_ohlcv(ohlcv)
     cdef int n = c_ohlcv.shape[0]
     
-    # Process Options
+    # 2. Process Options
     ks, ts, types, n_opts = _process_chain(option_chain)
+    
+    # Cast tuple returns to typed ndarrays
     cdef np.ndarray[double, ndim=1, mode='c'] c_ks = ks
     cdef np.ndarray[double, ndim=1, mode='c'] c_ts = ts
     cdef np.ndarray[int, ndim=1, mode='c'] c_types = types
     
-    # Output Arrays (Size n-1 for vol because returns logic, but we map to n inside or align)
-    # The C logic computes returns internally (size n-1). 
-    # We allocate (n-1) for results to match returns index.
-    cdef np.ndarray[double, ndim=1] spot_vol = np.zeros(n-1)
-    cdef np.ndarray[double, ndim=1] jump_prob = np.zeros(n-1)
+    # 3. Alloc Outputs (n-1 because returns calculation drops 1 row)
+    cdef int n_ret = n - 1
+    cdef np.ndarray[double, ndim=1] spot_vol = np.zeros(n_ret)
+    cdef np.ndarray[double, ndim=1] jump_prob = np.zeros(n_ret)
     cdef np.ndarray[double, ndim=1] model_prices = np.zeros(n_opts)
     
     cdef SVCJParams p
     
-    # Run Optimization using OHLCV
+    # 4. Optimization
     optimize_svcj(&c_ohlcv[0, 0], n, &p, &spot_vol[0], &jump_prob[0])
     
-    # Price using *Current* Spot Vol (Last Element)
-    price_option_chain(s0, &c_ks[0], &c_ts[0], &c_types[0], n_opts, &p, spot_vol[n-2], &model_prices[0])
+    # 5. Pricing (Use last fitted spot vol)
+    price_option_chain(s0, &c_ks[0], &c_ts[0], &c_types[0], n_opts, &p, spot_vol[n_ret-1], &model_prices[0])
     
     return {
         "params": {
@@ -73,12 +75,9 @@ def generate_asset_option_adjusted(object ohlcv, double s0, object option_chain)
     }
 
 # --- Method 2: Market Wide Rolling ---
-def analyze_market_rolling(object market_ohlcv_dict, int window):
-    # This is tricky for "Matrix In" if assets have different inputs.
-    # We assume input is a 3D Tensor: (Assets, Time, 5)
-    cdef np.ndarray[double, ndim=3] data = np.asarray(market_ohlcv_dict, dtype=np.float64)
-    # Check layout: (Assets, Time, 5) vs (Time, Assets, 5)?
-    # Assuming (Assets, Time, 5) for C-contiguity per asset
+def analyze_market_rolling(object market_ohlcv_tensor, int window):
+    # Input is 3D Tensor: (Assets, Time, 5)
+    cdef np.ndarray[double, ndim=3, mode='c'] data = np.ascontiguousarray(market_ohlcv_tensor, dtype=np.float64)
     
     if data.shape[2] != 5:
         raise ValueError("3D Input must be (Assets, Time, 5)")
@@ -87,16 +86,16 @@ def analyze_market_rolling(object market_ohlcv_dict, int window):
     cdef int n_days = data.shape[1]
     cdef int n_windows = n_days - window
     
+    if n_windows < 1: return None
+    
     cdef np.ndarray[double, ndim=3] results = np.zeros((n_assets, n_windows, 5))
     cdef SVCJParams p
     cdef int i, w
     
-    # Need to be careful passing 3D slice to 2D pointer
-    # &data[i, w, 0] gives start of OHLCV for Asset i at Time w
-    
     with nogil:
         for i in prange(n_assets, schedule='dynamic'):
             for w in range(n_windows):
+                # Pass pointer to sub-slice [i, w, 0]
                 optimize_svcj(&data[i, w, 0], window, &p, NULL, NULL)
                 results[i, w, 0] = p.theta
                 results[i, w, 1] = p.kappa
@@ -107,7 +106,6 @@ def analyze_market_rolling(object market_ohlcv_dict, int window):
 
 # --- Method 3: Market Wide Current ---
 def analyze_market_current(object market_ohlcv_tensor):
-    # Input: (Assets, Time, 5)
     cdef np.ndarray[double, ndim=3, mode='c'] data = np.ascontiguousarray(market_ohlcv_tensor, dtype=np.float64)
     cdef int n_assets = data.shape[0]
     cdef int n_days = data.shape[1]
@@ -143,17 +141,15 @@ def generate_residue_analysis(object ohlcv):
     cdef np.ndarray[double, ndim=1] residues = np.zeros(n_ret)
     cdef SVCJParams p
     
-    # We need returns to calc residue
-    cdef np.ndarray[double, ndim=1] returns = np.zeros(n_ret)
-    
-    # Optimize
+    # 1. Calibrate to get Drift (mu)
     optimize_svcj(&c_ohlcv[0, 0], n, &p, NULL, NULL)
     
-    # Re-compute returns in Python for residue calc (or expose C func)
-    # Simple log diff of Close (Col 3)
+    # 2. Compute Residues (Realized Log Return - Expected Drift)
     cdef int t
+    cdef double log_ret
     for t in range(n_ret):
-        returns[t] = np.log(c_ohlcv[t+1, 3] / c_ohlcv[t, 3])
-        residues[t] = returns[t] - (p.mu * (1.0/252.0))
+        # Log Return of Close price (Index 3)
+        log_ret = np.log(c_ohlcv[t+1, 3] / c_ohlcv[t, 3])
+        residues[t] = log_ret - (p.mu * (1.0/252.0))
         
     return residues
