@@ -13,8 +13,6 @@ void clean_returns(double* returns, int n) {
 
 // Compute ln(C_t / C_{t-1}) from OHLCV matrix
 void compute_log_returns(double* ohlcv, int n_rows, double* out_returns) {
-    // ohlcv is flat array: row i, col j -> ohlcv[i*N_COLS + j]
-    // returns size is n_rows - 1
     for(int i=1; i<n_rows; i++) {
         double prev_c = ohlcv[(i-1)*N_COLS + IDX_CLOSE];
         double curr_c = ohlcv[i*N_COLS + IDX_CLOSE];
@@ -31,32 +29,26 @@ void check_constraints(SVCJParams* p) {
     if(p->lambda_j < 0.05) p->lambda_j = 0.05; if(p->lambda_j > 252.0) p->lambda_j = 252.0; 
     if(p->sigma_j < 0.005) p->sigma_j = 0.005; if(p->sigma_j > 0.3) p->sigma_j = 0.3; 
     
-    // Feller Soft
+    // Feller Soft Constraint
     double feller = 2.0 * p->kappa * p->theta;
     if (p->sigma_v * p->sigma_v > feller * 4.0) p->sigma_v = sqrt(feller * 4.0);
 }
 
-// --- Robust Initialization using Garman-Klass (High-Low) ---
-// This uses OHLCV to find a better 'Theta' than just Close-Close variance
+// --- Robust Initialization using Garman-Klass ---
 void estimate_initial_params_ohlcv(double* ohlcv, int n, SVCJParams* p) {
     double sum_gk = 0.0;
-    
-    // Garman-Klass Volatility Estimator
-    // 0.5 * ln(H/L)^2 - (2*ln(2)-1) * ln(C/O)^2
+    // Garman-Klass: 0.5*ln(H/L)^2 - (2ln2-1)*ln(C/O)^2
     for(int i=0; i<n; i++) {
         double O = ohlcv[i*N_COLS + IDX_OPEN];
         double H = ohlcv[i*N_COLS + IDX_HIGH];
         double L = ohlcv[i*N_COLS + IDX_LOW];
         double C = ohlcv[i*N_COLS + IDX_CLOSE];
-        
         if(L < 1e-9) L = 1e-9; if(O < 1e-9) O = 1e-9;
-        
         double hl = log(H/L);
         double co = log(C/O);
         double val = 0.5 * hl*hl - (2.0*log(2.0)-1.0) * co*co;
         if(val > 0) sum_gk += val;
     }
-    
     double mean_gk = sum_gk / n;
     double rv_annual = mean_gk * 252.0;
 
@@ -70,7 +62,6 @@ void estimate_initial_params_ohlcv(double* ohlcv, int n, SVCJParams* p) {
     p->lambda_j = 0.5; 
     p->mu_j = 0.0;
     p->sigma_j = sqrt(rv_annual/252.0) * 4.0; 
-    
     check_constraints(p);
 }
 
@@ -89,7 +80,6 @@ double ukf_log_likelihood(double* returns, int n, SVCJParams* p, double* out_spo
         double y = returns[t] - drift * DT;
 
         // Phenotypic Mixing: Robust Variance Floor
-        // Mix instantaneous prediction with Long-Run mean to prevent collapse
         double robust_var_d = fmax(v_pred, 0.25 * p->theta) * DT; 
         
         // Likelihoods
@@ -103,10 +93,9 @@ double ukf_log_likelihood(double* returns, int n, SVCJParams* p, double* out_spo
         double prob_prior = p->lambda_j * DT;
         if(prob_prior > 0.9) prob_prior = 0.9;
         
-        double num = pdf_j * prob_prior;
-        double den = num + pdf_d * (1.0 - prob_prior);
+        double den = pdf_j * prob_prior + pdf_d * (1.0 - prob_prior);
         if(den < 1e-15) den = 1e-15;
-        double prob_posterior = num / den;
+        double prob_posterior = (pdf_j * prob_prior) / den;
         
         // Update
         double S = v_pred * DT + prob_posterior * var_j;
@@ -123,13 +112,9 @@ double ukf_log_likelihood(double* returns, int n, SVCJParams* p, double* out_spo
     }
     
     // MAP Penalties
-    // Penalty 1: Theta shouldn't deviate too far from Garman-Klass proxy
     double theta_penalty = -50.0 * pow(log(p->theta) - log(realized_theta_proxy), 2);
-    
-    // Penalty 2: Jump Size validity
     double target_jump = sqrt(realized_theta_proxy/252.0) * 3.0;
     double jump_penalty = -20.0 * pow(log(p->sigma_j) - log(target_jump), 2);
-    
     double rho_penalty = -2.0 * pow(p->rho + 0.5, 2);
 
     if(isnan(ll) || isinf(ll)) return -1e15;
@@ -138,12 +123,9 @@ double ukf_log_likelihood(double* returns, int n, SVCJParams* p, double* out_spo
 
 // --- Optimization ---
 void optimize_svcj(double* ohlcv, int n, SVCJParams* p, double* out_spot_vol, double* out_jump_prob) {
-    // 1. Estimate Start Params using OHLCV (Garman-Klass)
     estimate_initial_params_ohlcv(ohlcv, n, p);
-    double theta_proxy = p->theta; // Keep this as anchor
+    double theta_proxy = p->theta;
     
-    // 2. Compute Returns Vector for UKF (Close-to-Close)
-    // Note: n rows of data = n-1 returns
     int n_ret = n - 1;
     double* returns = (double*)malloc(n_ret * sizeof(double));
     if(!returns) return;
@@ -151,7 +133,6 @@ void optimize_svcj(double* ohlcv, int n, SVCJParams* p, double* out_spot_vol, do
     compute_log_returns(ohlcv, n, returns);
     clean_returns(returns, n_ret);
 
-    // 3. Nelder-Mead
     int n_dim = 5;
     double simplex[6][5];
     double scores[6];
@@ -220,9 +201,7 @@ void optimize_svcj(double* ohlcv, int n, SVCJParams* p, double* out_spot_vol, do
     p->kappa = simplex[best][0]; p->theta = simplex[best][1]; p->sigma_v = simplex[best][2];
     p->rho = simplex[best][3]; p->lambda_j = simplex[best][4];
     
-    // Output Population
     ukf_log_likelihood(returns, n_ret, p, out_spot_vol, out_jump_prob, theta_proxy);
-    
     free(returns);
 }
 

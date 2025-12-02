@@ -8,7 +8,7 @@
 
 // Configuration
 #define DT (1.0/252.0)
-#define NM_ITER 250
+#define NM_ITER 200
 #define SQRT_2PI 2.50662827463
 
 // Data Column Indices (OHLCV)
