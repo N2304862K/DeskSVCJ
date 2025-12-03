@@ -9,8 +9,8 @@
 // Configuration
 #define DT (1.0/252.0)
 #define NM_ITER 400
-#define RESTARTS 2
 #define SQRT_2PI 2.50662827463
+#define OCCAM_WEIGHT 5.0  // Heavy penalty for Jump complexity
 
 // Data Indices
 #define IDX_OPEN 0
@@ -32,7 +32,7 @@ typedef struct {
 } SVCJParams;
 
 void clean_returns(double* returns, int n);
-void compute_intraday_returns(double* ohlcv, int n_rows, double* out_returns); // Changed
+void compute_log_returns(double* ohlcv, int n_rows, double* out_returns);
 void check_constraints(SVCJParams* params);
 
 void estimate_initial_params_smart(double* ohlcv, int n, SVCJParams* p);
