@@ -6,10 +6,12 @@
 #include <stdio.h>
 #include <string.h>
 
+// Configuration
 #define DT (1.0/252.0)
-#define NM_ITER 400
+#define MAX_ITER 500       // Max limit (rarely hit with early stop)
+#define STOP_TOL 1e-6      // Early stopping threshold (ML-style convergence)
 #define SQRT_2PI 2.50662827463
-#define OCCAM_WEIGHT 5.0 
+#define OCCAM_WEIGHT 2.0   // Adjusted penalty
 
 #define IDX_OPEN 0
 #define IDX_HIGH 1
@@ -32,8 +34,9 @@ typedef struct {
 void clean_returns(double* returns, int n);
 void compute_log_returns(double* ohlcv, int n_rows, double* out_returns);
 void check_constraints(SVCJParams* params);
-void estimate_initial_params_smart(double* ohlcv, int n, SVCJParams* p);
-void optimize_svcj(double* ohlcv, int n, SVCJParams* params, double* out_spot_vol, double* out_jump_prob);
+
+// Optimization
+void optimize_svcj_stateful(double* ohlcv, int n, SVCJParams* params, SVCJParams* prev_params, double* out_spot_vol, double* out_jump_prob);
 double ukf_log_likelihood(double* returns, int n, SVCJParams* params, double* out_spot_vol, double* out_jump_prob, double theta_anchor);
 void price_option_chain(double s0, double* strikes, double* expiries, int* types, int n_opts, SVCJParams* params, double spot_vol, double* out_prices);
 
