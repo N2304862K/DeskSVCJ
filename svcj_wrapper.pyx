@@ -9,7 +9,6 @@ from cython.parallel import prange
 cdef extern from "svcj.h":
     ctypedef struct SVCJParams:
         double mu, kappa, theta, sigma_v, rho, lambda_j, mu_j, sigma_j
-    void clean_returns(double* returns, int n) nogil
     void optimize_svcj(double* ohlcv, int n, SVCJParams* params, double* out_spot_vol, double* out_jump_prob) nogil
     void price_option_chain(double s0, double* strikes, double* expiries, int* types, int n_opts, SVCJParams* params, double spot_vol, double* out_prices) nogil
 
@@ -33,18 +32,20 @@ def generate_asset_option_adjusted(object ohlcv, double s0, object option_chain)
     cdef np.ndarray[double, ndim=1, mode='c'] c_ks = ks
     cdef np.ndarray[double, ndim=1, mode='c'] c_ts = ts
     cdef np.ndarray[int, ndim=1, mode='c'] c_types = types
+    
     cdef int n_ret = n - 1
     cdef np.ndarray[double, ndim=1] spot_vol = np.zeros(n_ret)
     cdef np.ndarray[double, ndim=1] jump_prob = np.zeros(n_ret)
     cdef np.ndarray[double, ndim=1] model_prices = np.zeros(n_opts)
     cdef SVCJParams p
+    
     optimize_svcj(&c_ohlcv[0, 0], n, &p, &spot_vol[0], &jump_prob[0])
     price_option_chain(s0, &c_ks[0], &c_ts[0], &c_types[0], n_opts, &p, spot_vol[n_ret-1], &model_prices[0])
+    
     return {"params": {"kappa": p.kappa, "theta": p.theta, "rho": p.rho, "lambda_j": p.lambda_j}, "spot_vol": spot_vol, "jump_prob": jump_prob, "model_prices": model_prices}
 
 def analyze_market_rolling(object market_ohlcv_tensor, int window):
     cdef np.ndarray[double, ndim=3, mode='c'] data = np.ascontiguousarray(market_ohlcv_tensor, dtype=np.float64)
-    if data.shape[2] != 5: raise ValueError("Input must be (Assets, Time, 5)")
     cdef int n_assets = data.shape[0]
     cdef int n_days = data.shape[1]
     cdef int n_windows = n_days - window
