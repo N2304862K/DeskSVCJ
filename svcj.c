@@ -21,38 +21,19 @@ void check_constraints(SVCJParams* p) {
     if(p->theta < 0.0001) p->theta = 0.0001; if(p->theta > 2.0) p->theta = 2.0; 
     if(p->sigma_v < 0.01) p->sigma_v = 0.01; if(p->sigma_v > 5.0) p->sigma_v = 5.0;
     if(p->rho > 0.99) p->rho = 0.99;       if(p->rho < -0.99) p->rho = -0.99;
-    if(p->lambda_j < 0.001) p->lambda_j = 0.001; if(p->lambda_j > 200.0) p->lambda_j = 200.0; 
+    
+    // Allow Lambda to go very low or very high, don't clamp too tight
+    if(p->lambda_j < 0.001) p->lambda_j = 0.001; 
+    if(p->lambda_j > 200.0) p->lambda_j = 200.0; 
+    
     if(p->sigma_j < 0.001) p->sigma_j = 0.001;
     
+    // Relaxed Feller for estimation stability
     double feller = 2.0 * p->kappa * p->theta;
     if (p->sigma_v * p->sigma_v > feller * 10.0) p->sigma_v = sqrt(feller * 10.0);
 }
 
-// Smart Init
-void estimate_initial_params_smart(double* ohlcv, int n, SVCJParams* p) {
-    double sum_gk = 0.0;
-    for(int i=0; i<n; i++) {
-        double O = ohlcv[i*N_COLS + IDX_OPEN]; double H = ohlcv[i*N_COLS + IDX_HIGH];
-        double L = ohlcv[i*N_COLS + IDX_LOW];  double C = ohlcv[i*N_COLS + IDX_CLOSE];
-        if(L < 1e-9) L = 1e-9; if(O < 1e-9) O = 1e-9;
-        double hl = log(H/L); double co = log(C/O);
-        double val = 0.5 * hl*hl - (2.0*log(2.0)-1.0) * co*co;
-        if(val > 0) sum_gk += val;
-    }
-    double rv_annual = (sum_gk / n) * 252.0;
-
-    p->mu = 0.0; 
-    p->theta = rv_annual; if(p->theta < 0.0025) p->theta = 0.0025;
-    p->kappa = 3.0; 
-    p->sigma_v = sqrt(p->theta); 
-    p->rho = -0.5;
-    p->lambda_j = 0.2; // Start Low to encourage Diffusion fitting
-    p->mu_j = 0.0; 
-    p->sigma_j = sqrt(rv_annual/252.0) * 3.0; 
-    check_constraints(p);
-}
-
-// Likelihood with Occam's Razor
+// --- Likelihood Function (with MAP Penalties) ---
 double ukf_log_likelihood(double* returns, int n, SVCJParams* p, double* out_spot_vol, double* out_jump_prob, double theta_anchor) {
     double ll = 0.0;
     double v = p->theta;
@@ -63,6 +44,8 @@ double ukf_log_likelihood(double* returns, int n, SVCJParams* p, double* out_spo
         if(v_pred < 1e-6) v_pred = 1e-6;
 
         double y = returns[t] - (p->mu - 0.5 * v_pred) * DT;
+        
+        // Robust Diffusive Variance (prevents collapse)
         double robust_var_d = fmax(v_pred, 0.1 * p->theta) * DT; 
         
         double pdf_d = (1.0 / (sqrt(robust_var_d) * SQRT_2PI)) * exp(-0.5 * y*y / robust_var_d);
@@ -85,49 +68,53 @@ double ukf_log_likelihood(double* returns, int n, SVCJParams* p, double* out_spo
         ll += log(den); 
     }
     
-    // PENALTIES
-    // 1. Anchor Theta weakly
-    double theta_penalty = -5.0 * pow(log(p->theta) - log(theta_anchor), 2);
+    // Penalties: Keep Theta anchored, but let Lambda/Sigma_J float freely
+    double theta_penalty = -10.0 * pow(log(p->theta) - log(theta_anchor), 2);
+    // Weak rho penalty to keep it realistic
+    double rho_penalty = -2.0 * pow(p->rho + 0.5, 2); 
     
-    // 2. Occam's Razor: Penalize Jumps. 
-    // We subtract likelihood for every unit of Lambda. 
-    // This stops the model from setting Lambda=20 just to fit noise.
-    double complexity_penalty = -1.5 * p->lambda_j; 
-
     if(isnan(ll) || isinf(ll)) return -1e15;
-    return ll + theta_penalty + complexity_penalty;
+    return ll + theta_penalty + rho_penalty;
 }
 
+// --- Grid Search Initialization (The Fix for Stuck Params) ---
 void grid_search_init(double* returns, int n, SVCJParams* p, double theta_anchor) {
-    double lambdas[] = {0.1, 1.0, 10.0}; 
-    double vol_vols[] = {0.1, 1.0};
-    double rhos[] = {-0.7, -0.2};
+    // We define a grid of "Regimes"
+    double lambdas[] = {0.1, 5.0, 25.0}; // Rare, Occasional, Frequent
+    double vol_vols[] = {0.1, 0.5, 2.0}; // Stable, Volatile, Crisis
+    double rhos[] = {-0.8, -0.3};        // High Corr, Low Corr
     
     double best_score = -1e15;
     SVCJParams best_p = *p;
     
+    // Brute force the grid
     for(int i=0; i<3; i++) {
-        for(int j=0; j<2; j++) {
+        for(int j=0; j<3; j++) {
             for(int k=0; k<2; k++) {
                 SVCJParams temp = *p;
                 temp.lambda_j = lambdas[i];
                 temp.sigma_v = vol_vols[j];
                 temp.rho = rhos[k];
-                temp.theta = theta_anchor;
-                temp.kappa = 3.0;
-                temp.sigma_j = sqrt(theta_anchor/252.0) * 4.0;
+                temp.theta = theta_anchor; // Trust GK anchor
+                temp.kappa = 4.0;
+                temp.mu_j = 0.0;
+                temp.sigma_j = sqrt(theta_anchor/252.0) * 4.0; 
                 
                 check_constraints(&temp);
                 double score = ukf_log_likelihood(returns, n, &temp, NULL, NULL, theta_anchor);
-                if(score > best_score) { best_score = score; best_p = temp; }
+                
+                if(score > best_score) {
+                    best_score = score;
+                    best_p = temp;
+                }
             }
         }
     }
-    *p = best_p;
+    *p = best_p; // Set the struct to the winner of the grid search
 }
 
 void optimize_svcj(double* ohlcv, int n, SVCJParams* p, double* out_spot_vol, double* out_jump_prob) {
-    // 1. GK Anchor
+    // 1. Get Theta Anchor via Garman-Klass
     double sum_gk = 0.0;
     for(int i=0; i<n; i++) {
         double O=ohlcv[i*N_COLS+0]; double H=ohlcv[i*N_COLS+1];
@@ -140,68 +127,89 @@ void optimize_svcj(double* ohlcv, int n, SVCJParams* p, double* out_spot_vol, do
     double theta_anchor = (sum_gk/n) * 252.0;
     if(theta_anchor < 0.0025) theta_anchor = 0.0025;
     
+    // 2. Prepare Returns
     int n_ret = n - 1;
     double* returns = (double*)malloc(n_ret * sizeof(double));
     if(!returns) return;
     compute_log_returns(ohlcv, n, returns);
     clean_returns(returns, n_ret);
 
-    // 2. Grid Search
+    // 3. Grid Search Init (Crucial Step)
     p->theta = theta_anchor; 
     grid_search_init(returns, n_ret, p, theta_anchor);
 
-    // 3. Optimization
+    // 4. Nelder-Mead Optimization
     int n_dim = 5;
     double simplex[6][5];
     double scores[6];
     
-    for(int restart=0; restart<RESTARTS; restart++) {
-        if(restart > 0) { p->lambda_j = (p->lambda_j < 1.0) ? 5.0 : 0.2; check_constraints(p); }
-
-        for(int i=0; i<=n_dim; i++) {
-            SVCJParams temp = *p;
-            if(i==1) temp.kappa *= 1.2; if(i==2) temp.theta *= 1.2;
-            if(i==3) temp.sigma_v *= 1.2; if(i==4) temp.rho -= 0.1;
-            if(i==5) temp.lambda_j *= 1.5;
-            check_constraints(&temp);
-            simplex[i][0] = temp.kappa; simplex[i][1] = temp.theta; simplex[i][2] = temp.sigma_v;
-            simplex[i][3] = temp.rho;   simplex[i][4] = temp.lambda_j;
-            scores[i] = ukf_log_likelihood(returns, n_ret, &temp, NULL, NULL, theta_anchor);
-        }
+    // Init Simplex around Grid Search Winner
+    for(int i=0; i<=n_dim; i++) {
+        SVCJParams temp = *p;
+        if(i==1) temp.kappa *= 1.2;
+        if(i==2) temp.theta *= 1.2;
+        if(i==3) temp.sigma_v *= 1.2;
+        if(i==4) temp.rho -= 0.1;
+        if(i==5) temp.lambda_j *= 1.5;
+        check_constraints(&temp);
         
-        for(int iter=0; iter<NM_ITER; iter++) {
-            int vs[6]; for(int k=0; k<6; k++) vs[k]=k;
-            for(int i=0; i<6; i++) for(int j=i+1; j<6; j++) if(scores[vs[j]] > scores[vs[i]]) { int t=vs[i]; vs[i]=vs[j]; vs[j]=t; }
-            
-            double c[5] = {0}; for(int i=0; i<5; i++) for(int k=0; k<5; k++) c[k] += simplex[vs[i]][k]; for(int k=0; k<5; k++) c[k] /= 5.0;
-            
-            double ref[5]; SVCJParams rp = *p; for(int k=0; k<5; k++) ref[k] = c[k] + 1.0 * (c[k] - simplex[vs[5]][k]);
-            rp.kappa=ref[0]; rp.theta=ref[1]; rp.sigma_v=ref[2]; rp.rho=ref[3]; rp.lambda_j=ref[4]; check_constraints(&rp);
-            double r_score = ukf_log_likelihood(returns, n_ret, &rp, NULL, NULL, theta_anchor);
-            
-            if(r_score > scores[vs[0]]) {
-                double exp[5]; SVCJParams ep = *p; for(int k=0; k<5; k++) exp[k] = c[k] + 2.0 * (c[k] - simplex[vs[5]][k]);
-                ep.kappa=exp[0]; ep.theta=exp[1]; ep.sigma_v=exp[2]; ep.rho=exp[3]; ep.lambda_j=exp[4]; check_constraints(&ep);
-                double e_score = ukf_log_likelihood(returns, n_ret, &ep, NULL, NULL, theta_anchor);
-                if(e_score > r_score) { for(int k=0; k<5; k++) simplex[vs[5]][k] = exp[k]; scores[vs[5]] = e_score; } else { for(int k=0; k<5; k++) simplex[vs[5]][k] = ref[k]; scores[vs[5]] = r_score; }
-            } else if(r_score > scores[vs[4]]) { for(int k=0; k<5; k++) simplex[vs[5]][k] = ref[k]; scores[vs[5]] = r_score; }
+        simplex[i][0] = temp.kappa; simplex[i][1] = temp.theta; simplex[i][2] = temp.sigma_v;
+        simplex[i][3] = temp.rho;   simplex[i][4] = temp.lambda_j;
+        scores[i] = ukf_log_likelihood(returns, n_ret, &temp, NULL, NULL, theta_anchor);
+    }
+    
+    // Iterate
+    for(int iter=0; iter<NM_ITER; iter++) {
+        int vs[6]; for(int k=0; k<6; k++) vs[k]=k;
+        for(int i=0; i<6; i++) for(int j=i+1; j<6; j++) if(scores[vs[j]] > scores[vs[i]]) { int t=vs[i]; vs[i]=vs[j]; vs[j]=t; }
+        
+        double c[5] = {0};
+        for(int i=0; i<5; i++) for(int k=0; k<5; k++) c[k] += simplex[vs[i]][k];
+        for(int k=0; k<5; k++) c[k] /= 5.0;
+        
+        double ref[5]; SVCJParams rp = *p;
+        for(int k=0; k<5; k++) ref[k] = c[k] + 1.0 * (c[k] - simplex[vs[5]][k]);
+        rp.kappa=ref[0]; rp.theta=ref[1]; rp.sigma_v=ref[2]; rp.rho=ref[3]; rp.lambda_j=ref[4];
+        check_constraints(&rp);
+        double r_score = ukf_log_likelihood(returns, n_ret, &rp, NULL, NULL, theta_anchor);
+        
+        if(r_score > scores[vs[0]]) {
+            double exp[5]; SVCJParams ep = *p;
+            for(int k=0; k<5; k++) exp[k] = c[k] + 2.0 * (c[k] - simplex[vs[5]][k]);
+            ep.kappa=exp[0]; ep.theta=exp[1]; ep.sigma_v=exp[2]; ep.rho=exp[3]; ep.lambda_j=exp[4];
+            check_constraints(&ep);
+            double e_score = ukf_log_likelihood(returns, n_ret, &ep, NULL, NULL, theta_anchor);
+            if(e_score > r_score) { for(int k=0; k<5; k++) simplex[vs[5]][k] = exp[k]; scores[vs[5]] = e_score; } 
+            else { for(int k=0; k<5; k++) simplex[vs[5]][k] = ref[k]; scores[vs[5]] = r_score; }
+        } else if(r_score > scores[vs[4]]) {
+             for(int k=0; k<5; k++) simplex[vs[5]][k] = ref[k]; scores[vs[5]] = r_score;
+        } else {
+            double con[5]; SVCJParams cp = *p;
+            for(int k=0; k<5; k++) con[k] = c[k] + 0.5 * (simplex[vs[5]][k] - c[k]);
+            cp.kappa=con[0]; cp.theta=con[1]; cp.sigma_v=con[2]; cp.rho=con[3]; cp.lambda_j=con[4];
+            check_constraints(&cp);
+            double c_score = ukf_log_likelihood(returns, n_ret, &cp, NULL, NULL, theta_anchor);
+            if(c_score > scores[vs[5]]) { for(int k=0; k<5; k++) simplex[vs[5]][k] = con[k]; scores[vs[5]] = c_score; }
             else {
-                double con[5]; SVCJParams cp = *p; for(int k=0; k<5; k++) con[k] = c[k] + 0.5 * (simplex[vs[5]][k] - c[k]);
-                cp.kappa=con[0]; cp.theta=con[1]; cp.sigma_v=con[2]; cp.rho=con[3]; cp.lambda_j=con[4]; check_constraints(&cp);
-                double c_score = ukf_log_likelihood(returns, n_ret, &cp, NULL, NULL, theta_anchor);
-                if(c_score > scores[vs[5]]) { for(int k=0; k<5; k++) simplex[vs[5]][k] = con[k]; scores[vs[5]] = c_score; }
-                else { for(int i=1; i<6; i++) { int idx = vs[i]; SVCJParams sp = *p; for(int k=0; k<5; k++) simplex[idx][k] = simplex[vs[0]][k] + 0.5 * (simplex[idx][k] - simplex[vs[0]][k]); sp.kappa=simplex[idx][0]; sp.theta=simplex[idx][1]; sp.sigma_v=simplex[idx][2]; sp.rho=simplex[idx][3]; sp.lambda_j=simplex[idx][4]; check_constraints(&sp); scores[idx] = ukf_log_likelihood(returns, n_ret, &sp, NULL, NULL, theta_anchor); } }
+                for(int i=1; i<6; i++) {
+                    int idx = vs[i]; SVCJParams sp = *p;
+                    for(int k=0; k<5; k++) simplex[idx][k] = simplex[vs[0]][k] + 0.5 * (simplex[idx][k] - simplex[vs[0]][k]);
+                    sp.kappa=simplex[idx][0]; sp.theta=simplex[idx][1]; sp.sigma_v=simplex[idx][2]; sp.rho=simplex[idx][3]; sp.lambda_j=simplex[idx][4];
+                    check_constraints(&sp); scores[idx] = ukf_log_likelihood(returns, n_ret, &sp, NULL, NULL, theta_anchor);
+                }
             }
         }
-        int best = 0; for(int i=1; i<6; i++) if(scores[i] > scores[best]) best = i;
-        p->kappa = simplex[best][0]; p->theta = simplex[best][1]; p->sigma_v = simplex[best][2]; p->rho = simplex[best][3]; p->lambda_j = simplex[best][4];
     }
+    
+    int best = 0; for(int i=1; i<6; i++) if(scores[i] > scores[best]) best = i;
+    p->kappa = simplex[best][0]; p->theta = simplex[best][1]; p->sigma_v = simplex[best][2];
+    p->rho = simplex[best][3]; p->lambda_j = simplex[best][4];
     
     ukf_log_likelihood(returns, n_ret, p, out_spot_vol, out_jump_prob, theta_anchor);
     free(returns);
 }
 
-// Pricing (No Changes needed, omitted for brevity, identical to previous)
+// Pricing Unchanged
 double normal_cdf(double x) { return 0.5 * erfc(-x * M_SQRT1_2); }
 double bs_calc(double S, double K, double T, double r, double v, int type) {
     if(T < 1e-4) return (type==1)?fmax(S-K,0):fmax(K-S,0);
