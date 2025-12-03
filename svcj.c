@@ -25,14 +25,11 @@ void check_constraints(SVCJParams* p) {
     if(p->rho > 0.999) p->rho = 0.999;       if(p->rho < -0.999) p->rho = -0.999;
     if(p->lambda_j < 0.0001) p->lambda_j = 0.0001; if(p->lambda_j > 200.0) p->lambda_j = 200.0; 
     if(p->sigma_j < 0.0001) p->sigma_j = 0.0001; if(p->sigma_j > 1.0) p->sigma_j = 1.0;
-    
-    // Damping: Prevent Vol of Vol from exploding without data support
     double feller = 2.0 * p->kappa * p->theta;
-    if (p->sigma_v * p->sigma_v > feller * 20.0) p->sigma_v = sqrt(feller * 20.0);
+    if (p->sigma_v * p->sigma_v > feller * 50.0) p->sigma_v = sqrt(feller * 50.0);
 }
 
 void estimate_initial_params_smart(double* ohlcv, int n, SVCJParams* p) {
-    // Garman-Klass Estimator (Matching Python Pipeline)
     double sum_gk = 0.0;
     for(int i=0; i<n; i++) {
         double O=ohlcv[i*N_COLS+0]; double H=ohlcv[i*N_COLS+1];
@@ -43,15 +40,9 @@ void estimate_initial_params_smart(double* ohlcv, int n, SVCJParams* p) {
         if(val>0) sum_gk+=val;
     }
     double rv = (sum_gk/n) * 252.0;
-
-    p->mu = 0.0; 
-    p->theta = rv; 
-    p->kappa = 4.0; 
-    p->sigma_v = sqrt(p->theta); 
-    p->rho = -0.5;
-    p->lambda_j = 0.1; 
-    p->mu_j = 0.0; 
-    p->sigma_j = sqrt(rv/252.0) * 4.0; 
+    p->mu = 0.0; p->theta = rv; 
+    p->kappa = 4.0; p->sigma_v = sqrt(p->theta); p->rho = -0.5;
+    p->lambda_j = 0.1; p->mu_j = 0.0; p->sigma_j = sqrt(rv/252.0) * 4.0; 
     check_constraints(p);
 }
 
@@ -63,31 +54,24 @@ double ukf_log_likelihood(double* returns, int n, SVCJParams* p, double* out_spo
     for(int t=0; t<n; t++) {
         double v_pred = v + p->kappa * (p->theta - v) * DT;
         if(v_pred < 1e-7) v_pred = 1e-7;
-
         double y = returns[t] - (p->mu - 0.5 * v_pred) * DT;
         double robust_var_d = fmax(v_pred, 0.1 * p->theta) * DT; 
-        
         double pdf_d = (1.0 / (sqrt(robust_var_d) * SQRT_2PI)) * exp(-0.5 * y*y / robust_var_d);
         double total_var_j = robust_var_d + var_j; 
         double y_j = y - p->mu_j; 
         double pdf_j = (1.0 / (sqrt(total_var_j) * SQRT_2PI)) * exp(-0.5 * y_j*y_j / total_var_j);
-        
         double prob_prior = (p->lambda_j * DT > 0.99) ? 0.99 : p->lambda_j * DT;
         double den = pdf_j * prob_prior + pdf_d * (1.0 - prob_prior);
         if(den < 1e-20) den = 1e-20;
         double prob_posterior = (pdf_j * prob_prior) / den;
-        
         double S = v_pred * DT + prob_posterior * var_j;
         double K = (p->rho * p->sigma_v * DT) / S;
         v = v_pred + K * y;
         if(v < 1e-7) v = 1e-7; if(v > 10.0) v = 10.0; 
-
         if(out_spot_vol) out_spot_vol[t] = sqrt(v_pred); 
         if(out_jump_prob) out_jump_prob[t] = prob_posterior;
-        
         ll += log(den); 
     }
-    
     if(isnan(ll) || isinf(ll)) return -1e15;
     return ll;
 }
@@ -95,15 +79,11 @@ double ukf_log_likelihood(double* returns, int n, SVCJParams* p, double* out_spo
 void grid_search_init(double* returns, int n, SVCJParams* p) {
     double thetas[] = {p->theta * 0.8, p->theta, p->theta * 1.2};
     double lambdas[] = {0.1, 5.0, 20.0};
-    
     double best_score = -1e15;
     SVCJParams best_p = *p;
-    
     for(int i=0; i<3; i++) {
         for(int j=0; j<3; j++) {
-            SVCJParams temp = *p;
-            temp.theta = thetas[i];
-            temp.lambda_j = lambdas[j];
+            SVCJParams temp = *p; temp.theta = thetas[i]; temp.lambda_j = lambdas[j];
             check_constraints(&temp);
             double score = ukf_log_likelihood(returns, n, &temp, NULL, NULL);
             if(score > best_score) { best_score = score; best_p = temp; }
@@ -114,13 +94,11 @@ void grid_search_init(double* returns, int n, SVCJParams* p) {
 
 void optimize_svcj(double* ohlcv, int n, SVCJParams* p, double* out_spot_vol, double* out_jump_prob) {
     estimate_initial_params_smart(ohlcv, n, p);
-    
     int n_ret = n - 1;
     double* returns = (double*)malloc(n_ret * sizeof(double));
     if(!returns) return;
     compute_log_returns(ohlcv, n, returns);
     clean_returns(returns, n_ret);
-
     grid_search_init(returns, n_ret, p);
 
     int n_dim = 5;
@@ -133,7 +111,6 @@ void optimize_svcj(double* ohlcv, int n, SVCJParams* p, double* out_spot_vol, do
         if(i==3) temp.sigma_v *= 1.2; if(i==4) temp.rho -= 0.1;
         if(i==5) temp.lambda_j *= 1.5;
         check_constraints(&temp);
-        
         simplex[i][0]=temp.kappa; simplex[i][1]=temp.theta; simplex[i][2]=temp.sigma_v;
         simplex[i][3]=temp.rho;   simplex[i][4]=temp.lambda_j;
         scores[i] = ukf_log_likelihood(returns, n_ret, &temp, NULL, NULL);
@@ -142,14 +119,11 @@ void optimize_svcj(double* ohlcv, int n, SVCJParams* p, double* out_spot_vol, do
     for(int iter=0; iter<NM_ITER; iter++) {
         int vs[6]; for(int k=0; k<6; k++) vs[k]=k;
         for(int i=0; i<6; i++) for(int j=i+1; j<6; j++) if(scores[vs[j]] > scores[vs[i]]) { int t=vs[i]; vs[i]=vs[j]; vs[j]=t; }
-        
         double c[5]={0}; for(int i=0; i<5; i++) for(int k=0; k<5; k++) c[k]+=simplex[vs[i]][k];
         for(int k=0; k<5; k++) c[k]/=5.0;
-        
         double ref[5]; SVCJParams rp=*p; for(int k=0; k<5; k++) ref[k]=c[k]+1.0*(c[k]-simplex[vs[5]][k]);
         rp.kappa=ref[0]; rp.theta=ref[1]; rp.sigma_v=ref[2]; rp.rho=ref[3]; rp.lambda_j=ref[4];
         check_constraints(&rp); double r_score=ukf_log_likelihood(returns, n_ret, &rp, NULL, NULL);
-        
         if(r_score>scores[vs[0]]) {
             double exp[5]; SVCJParams ep=*p; for(int k=0; k<5; k++) exp[k]=c[k]+2.0*(c[k]-simplex[vs[5]][k]);
             ep.kappa=exp[0]; ep.theta=exp[1]; ep.sigma_v=exp[2]; ep.rho=exp[3]; ep.lambda_j=exp[4];
@@ -172,11 +146,9 @@ void optimize_svcj(double* ohlcv, int n, SVCJParams* p, double* out_spot_vol, do
             }
         }
     }
-    
     int best=0; for(int i=1; i<6; i++) if(scores[i]>scores[best]) best=i;
     p->kappa=simplex[best][0]; p->theta=simplex[best][1]; p->sigma_v=simplex[best][2];
     p->rho=simplex[best][3]; p->lambda_j=simplex[best][4];
-    
     ukf_log_likelihood(returns, n_ret, p, out_spot_vol, out_jump_prob);
     free(returns);
 }
