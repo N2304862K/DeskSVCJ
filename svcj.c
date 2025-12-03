@@ -3,7 +3,6 @@
 
 void clean_returns(double* returns, int n) {
     for(int i=0; i<n; i++) {
-        // Mathematical safety only, no data manipulation
         if(isnan(returns[i]) || isinf(returns[i])) returns[i] = 0.0;
         if(fabs(returns[i]) < 1e-12) returns[i] = 1e-12;
     }
@@ -13,7 +12,6 @@ void compute_log_returns(double* ohlcv, int n_rows, double* out_returns) {
     for(int i=1; i<n_rows; i++) {
         double prev = ohlcv[(i-1)*N_COLS + IDX_CLOSE];
         double curr = ohlcv[i*N_COLS + IDX_CLOSE];
-        // Mathematical safety for Log calculation
         if(prev <= 1e-9) prev = 1e-9;
         if(curr <= 1e-9) curr = 1e-9;
         out_returns[i-1] = log(curr / prev);
@@ -21,77 +19,68 @@ void compute_log_returns(double* ohlcv, int n_rows, double* out_returns) {
 }
 
 void check_constraints(SVCJParams* p) {
-    // Pure Domain Constraints (Physics), no Arbitrary caps
-    if(p->kappa < 0.01) p->kappa = 0.01;     if(p->kappa > 100.0) p->kappa = 100.0;
-    if(p->theta < 0.0001) p->theta = 0.0001; if(p->theta > 5.0) p->theta = 5.0; 
-    if(p->sigma_v < 0.001) p->sigma_v = 0.001; if(p->sigma_v > 10.0) p->sigma_v = 10.0;
+    if(p->kappa < 0.1) p->kappa = 0.1;     if(p->kappa > 50.0) p->kappa = 50.0;
+    if(p->theta < 0.0001) p->theta = 0.0001; if(p->theta > 2.0) p->theta = 2.0; 
+    if(p->sigma_v < 0.01) p->sigma_v = 0.01; if(p->sigma_v > 5.0) p->sigma_v = 5.0;
     if(p->rho > 0.999) p->rho = 0.999;       if(p->rho < -0.999) p->rho = -0.999;
-    if(p->lambda_j < 0.0001) p->lambda_j = 0.0001; if(p->lambda_j > 500.0) p->lambda_j = 500.0; 
+    if(p->lambda_j < 0.0001) p->lambda_j = 0.0001; if(p->lambda_j > 200.0) p->lambda_j = 200.0; 
     if(p->sigma_j < 0.0001) p->sigma_j = 0.0001; if(p->sigma_j > 1.0) p->sigma_j = 1.0;
     
-    // Feller Violation allowed (Heston trap avoidance), just damp it slightly
+    // Damping: Prevent Vol of Vol from exploding without data support
     double feller = 2.0 * p->kappa * p->theta;
-    if (p->sigma_v * p->sigma_v > feller * 50.0) p->sigma_v = sqrt(feller * 50.0);
+    if (p->sigma_v * p->sigma_v > feller * 20.0) p->sigma_v = sqrt(feller * 20.0);
 }
 
-// --- Smart Init (Unbiased) ---
 void estimate_initial_params_smart(double* ohlcv, int n, SVCJParams* p) {
-    // We use the WHOLE window just for the STARTING point of the simplex.
-    // The optimizer is free to move away from this.
-    double sum_sq = 0.0;
-    for(int i=1; i<n; i++) {
-        double r = log(ohlcv[i*N_COLS+3]/ohlcv[(i-1)*N_COLS+3]);
-        sum_sq += r*r;
+    // Garman-Klass Estimator (Matching Python Pipeline)
+    double sum_gk = 0.0;
+    for(int i=0; i<n; i++) {
+        double O=ohlcv[i*N_COLS+0]; double H=ohlcv[i*N_COLS+1];
+        double L=ohlcv[i*N_COLS+2]; double C=ohlcv[i*N_COLS+3];
+        if(L<1e-9)L=1e-9; if(O<1e-9)O=1e-9;
+        double hl=log(H/L); double co=log(C/O);
+        double val = 0.5*hl*hl - (2.0*log(2.0)-1.0)*co*co;
+        if(val>0) sum_gk+=val;
     }
-    double rv = (sum_sq/(n-1)) * 252.0;
+    double rv = (sum_gk/n) * 252.0;
 
     p->mu = 0.0; 
     p->theta = rv; 
     p->kappa = 4.0; 
     p->sigma_v = sqrt(p->theta); 
     p->rho = -0.5;
-    p->lambda_j = 0.1; // Start assuming diffusion
+    p->lambda_j = 0.1; 
     p->mu_j = 0.0; 
     p->sigma_j = sqrt(rv/252.0) * 4.0; 
     check_constraints(p);
 }
 
-// --- Pure Likelihood (No Anchors) ---
 double ukf_log_likelihood(double* returns, int n, SVCJParams* p, double* out_spot_vol, double* out_jump_prob) {
     double ll = 0.0;
-    double v = p->theta; // Start at Long Run mean
+    double v = p->theta; 
     double var_j = p->mu_j*p->mu_j + p->sigma_j*p->sigma_j;
     
     for(int t=0; t<n; t++) {
-        // Heston Predict
         double v_pred = v + p->kappa * (p->theta - v) * DT;
         if(v_pred < 1e-7) v_pred = 1e-7;
 
         double y = returns[t] - (p->mu - 0.5 * v_pred) * DT;
+        double robust_var_d = fmax(v_pred, 0.1 * p->theta) * DT; 
         
-        // Diffusion Likelihood
-        double var_d = v_pred * DT;
-        double pdf_d = (1.0 / (sqrt(var_d) * SQRT_2PI)) * exp(-0.5 * y*y / var_d);
-        
-        // Jump Likelihood
-        double total_var_j = var_d + var_j; 
+        double pdf_d = (1.0 / (sqrt(robust_var_d) * SQRT_2PI)) * exp(-0.5 * y*y / robust_var_d);
+        double total_var_j = robust_var_d + var_j; 
         double y_j = y - p->mu_j; 
         double pdf_j = (1.0 / (sqrt(total_var_j) * SQRT_2PI)) * exp(-0.5 * y_j*y_j / total_var_j);
         
-        // Bayesian Filter Step
         double prob_prior = (p->lambda_j * DT > 0.99) ? 0.99 : p->lambda_j * DT;
         double den = pdf_j * prob_prior + pdf_d * (1.0 - prob_prior);
-        
-        // Numerical safety only
         if(den < 1e-20) den = 1e-20;
-        
         double prob_posterior = (pdf_j * prob_prior) / den;
         
-        // Update State
         double S = v_pred * DT + prob_posterior * var_j;
         double K = (p->rho * p->sigma_v * DT) / S;
         v = v_pred + K * y;
-        if(v < 1e-7) v = 1e-7; if(v > 10.0) v = 10.0; // Physics bounds only
+        if(v < 1e-7) v = 1e-7; if(v > 10.0) v = 10.0; 
 
         if(out_spot_vol) out_spot_vol[t] = sqrt(v_pred); 
         if(out_jump_prob) out_jump_prob[t] = prob_posterior;
@@ -100,13 +89,11 @@ double ukf_log_likelihood(double* returns, int n, SVCJParams* p, double* out_spo
     }
     
     if(isnan(ll) || isinf(ll)) return -1e15;
-    return ll; // Pure MLE
+    return ll;
 }
 
-// --- Grid Search Init ---
 void grid_search_init(double* returns, int n, SVCJParams* p) {
-    // Scan high/low volatility regimes to find best starting basin
-    double thetas[] = {p->theta * 0.5, p->theta, p->theta * 1.5};
+    double thetas[] = {p->theta * 0.8, p->theta, p->theta * 1.2};
     double lambdas[] = {0.1, 5.0, 20.0};
     
     double best_score = -1e15;
@@ -118,7 +105,6 @@ void grid_search_init(double* returns, int n, SVCJParams* p) {
             temp.theta = thetas[i];
             temp.lambda_j = lambdas[j];
             check_constraints(&temp);
-            
             double score = ukf_log_likelihood(returns, n, &temp, NULL, NULL);
             if(score > best_score) { best_score = score; best_p = temp; }
         }
@@ -135,10 +121,8 @@ void optimize_svcj(double* ohlcv, int n, SVCJParams* p, double* out_spot_vol, do
     compute_log_returns(ohlcv, n, returns);
     clean_returns(returns, n_ret);
 
-    // 1. Grid Search to find correct basin
     grid_search_init(returns, n_ret, p);
 
-    // 2. Nelder-Mead Optimization (Unconstrained Likelihood)
     int n_dim = 5;
     double simplex[6][5];
     double scores[6];
@@ -197,7 +181,6 @@ void optimize_svcj(double* ohlcv, int n, SVCJParams* p, double* out_spot_vol, do
     free(returns);
 }
 
-// Pricing Unchanged
 double normal_cdf(double x) { return 0.5 * erfc(-x * M_SQRT1_2); }
 double bs_calc(double S, double K, double T, double r, double v, int type) {
     if(T < 1e-4) return (type==1)?fmax(S-K,0):fmax(K-S,0);
