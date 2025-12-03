@@ -9,6 +9,7 @@ from cython.parallel import prange
 cdef extern from "svcj.h":
     ctypedef struct SVCJParams:
         double mu, kappa, theta, sigma_v, rho, lambda_j, mu_j, sigma_j
+    void clean_returns(double* returns, int n) nogil
     void optimize_svcj(double* ohlcv, int n, SVCJParams* params, double* out_spot_vol, double* out_jump_prob) nogil
     void price_option_chain(double s0, double* strikes, double* expiries, int* types, int n_opts, SVCJParams* params, double spot_vol, double* out_prices) nogil
 
@@ -48,44 +49,15 @@ def analyze_market_rolling(object market_ohlcv_tensor, int window):
     cdef int n_days = data.shape[1]
     cdef int n_windows = n_days - window
     if n_windows < 1: return None
-    
-    # 6 Cols: [Theta, Kappa, SigmaV, Rho, Lambda, SPOT_VOL_END]
-    cdef np.ndarray[double, ndim=3] results = np.zeros((n_assets, n_windows, 6))
+    cdef np.ndarray[double, ndim=3] results = np.zeros((n_assets, n_windows, 5))
     cdef SVCJParams p
-    
-    # Temp buffer for spot vol inside loop (max window size)
-    # We allocate for max possible size to be safe
-    cdef int max_ret = window
-    
     cdef int i, w
     with nogil:
-        # We need a per-thread buffer for spot vol.
-        # Since we can't malloc easily in nogil prange without careful cleanup,
-        # we will run simple range or use a fixed small array if window is fixed.
-        # For simplicity and safety in this snippet, we run serial or use careful manual memory.
-        # Here we assume serial for safety in the wrapper update.
-        for i in range(n_assets):
-            # Alloc temp buffer
-            # double* temp_vol = malloc(...) 
-            # In Cython loop, better to just use pointer offset if we want output.
-            # But optimize_svcj writes to output.
-            pass
-
-    # Re-implementation with Python loop for memory safety on the temp buffer
-    # Or strict allocation. Let's do strict allocation.
-    
-    cdef double[:] temp_vol = np.zeros(window) # Memory view
-    
-    for i in range(n_assets):
-        for w in range(n_windows):
-            optimize_svcj(&data[i, w, 0], window, &p, &temp_vol[0], NULL)
-            results[i, w, 0] = p.theta
-            results[i, w, 1] = p.kappa
-            results[i, w, 2] = p.sigma_v
-            results[i, w, 3] = p.rho
-            results[i, w, 4] = p.lambda_j
-            results[i, w, 5] = temp_vol[window - 2] # Last valid spot vol (n-1 returns)
-
+        for i in prange(n_assets, schedule='dynamic'):
+            for w in range(n_windows):
+                optimize_svcj(&data[i, w, 0], window, &p, NULL, NULL)
+                results[i, w, 0] = p.theta; results[i, w, 1] = p.kappa; results[i, w, 2] = p.sigma_v;
+                results[i, w, 3] = p.rho; results[i, w, 4] = p.lambda_j;
     return results
 
 def analyze_market_current(object market_ohlcv_tensor):

@@ -6,13 +6,11 @@
 #include <stdio.h>
 #include <string.h>
 
-// Configuration
 #define DT (1.0/252.0)
 #define NM_ITER 400
 #define SQRT_2PI 2.50662827463
 #define OCCAM_WEIGHT 5.0 
 
-// Data Indices
 #define IDX_OPEN 0
 #define IDX_HIGH 1
 #define IDX_LOW 2
@@ -34,7 +32,6 @@ typedef struct {
 void clean_returns(double* returns, int n);
 void compute_log_returns(double* ohlcv, int n_rows, double* out_returns);
 void check_constraints(SVCJParams* params);
-
 void estimate_initial_params_smart(double* ohlcv, int n, SVCJParams* p);
 void optimize_svcj(double* ohlcv, int n, SVCJParams* params, double* out_spot_vol, double* out_jump_prob);
 double ukf_log_likelihood(double* returns, int n, SVCJParams* params, double* out_spot_vol, double* out_jump_prob, double theta_anchor);
