@@ -17,6 +17,7 @@ void check_constraints(SVCJParams* p) {
     if(p->rho > 0.99) p->rho = 0.99; if(p->rho < -0.99) p->rho = -0.99;
     if(p->lambda_j < 0.01) p->lambda_j = 0.01; if(p->lambda_j > 1000.0) p->lambda_j = 1000.0;
     if(p->sigma_j < 0.001) p->sigma_j = 0.001;
+    
     double feller = 2.0 * p->kappa * p->theta;
     if (p->sigma_v * p->sigma_v > feller * 6.0) p->sigma_v = sqrt(feller * 6.0);
 }
@@ -32,7 +33,7 @@ void estimate_initial_params_ohlcv(double* ohlcv, int n, double dt, SVCJParams* 
         if(val>0) sum_gk += val;
     }
     double mean_gk = sum_gk / n;
-    double rv_annual = mean_gk / dt; 
+    double rv_annual = mean_gk / dt; // Normalize
 
     p->mu = 0.0; p->theta = rv_annual;
     p->kappa = 4.0; p->sigma_v = sqrt(p->theta); p->rho = -0.6;
@@ -73,14 +74,10 @@ double ukf_log_likelihood(double* returns, int n, double dt, SVCJParams* p, doub
         if(out_jump_prob) out_jump_prob[t]=post;
         ll += log(den);
     }
-    // Note: For LRT, we usually want RAW likelihood.
-    // However, the optimizer needs penalty. We return penalized for optimization,
-    // but the LRT function below will strip penalties for pure statistical test.
     double theta_pen = -50.0 * pow(log(p->theta) - log(theta_proxy), 2);
     return ll + theta_pen;
 }
 
-// Wrapper for raw likelihood (no penalty) for statistical testing
 double raw_likelihood(double* returns, int n, double dt, SVCJParams* p) {
     double ll=0; double v=p->theta;
     double var_j = p->mu_j*p->mu_j + p->sigma_j*p->sigma_j;
@@ -108,7 +105,6 @@ double raw_likelihood(double* returns, int n, double dt, SVCJParams* p) {
 void optimize_svcj(double* ohlcv, int n, double dt, SVCJParams* p, double* out_spot_vol, double* out_jump_prob) {
     estimate_initial_params_ohlcv(ohlcv, n, dt, p);
     double theta_proxy = p->theta;
-    
     double* ret = malloc((n-1)*sizeof(double));
     compute_log_returns(ohlcv, n, ret);
     
@@ -155,8 +151,7 @@ void optimize_svcj(double* ohlcv, int n, double dt, SVCJParams* p, double* out_s
     free(ret);
 }
 
-// --- STATISTICAL TEST IMPLEMENTATION ---
-// Approx Chi-Square CDF (Wilson-Hilferty) for p-value
+// Chi-Square Prob for LRT
 double chi2_p_value(double x, int k) {
     if(x <= 0) return 1.0;
     double s = 2.0/9.0/k;
@@ -166,62 +161,19 @@ double chi2_p_value(double x, int k) {
 
 void perform_likelihood_ratio_test(double* ohlcv_long, int len_long, int len_short, double dt, RegimeTestStats* out) {
     SVCJParams p_long, p_short;
-    
-    // 1. Fit Long Window (The "Null Hypothesis" Physics)
     optimize_svcj(ohlcv_long, len_long, dt, &p_long, NULL, NULL);
-    
-    // 2. Fit Short Window (The "Alternative Hypothesis" Physics)
-    // We pass pointer to the start of the short window (last len_short elements)
     int offset = len_long - len_short;
     optimize_svcj(ohlcv_long + offset*N_COLS, len_short, dt, &p_short, NULL, NULL);
     
-    // 3. Prepare Short Window Returns
     double* ret_short = malloc((len_short-1)*sizeof(double));
     compute_log_returns(ohlcv_long + offset*N_COLS, len_short, ret_short);
     
-    // 4. Calculate Likelihoods on Short Data
-    // L_Constrained: Short Data | Long Params
     out->ll_constrained = raw_likelihood(ret_short, len_short-1, dt, &p_long);
-    
-    // L_Unconstrained: Short Data | Short Params
     out->ll_unconstrained = raw_likelihood(ret_short, len_short-1, dt, &p_short);
-    
     free(ret_short);
     
-    // 5. Test Statistic D = 2 * (LL_Unconstrained - LL_Constrained)
     out->test_statistic = 2.0 * (out->ll_unconstrained - out->ll_constrained);
-    if(out->test_statistic < 0) out->test_statistic = 0; // Floating point noise
-    
-    // 6. P-Value (Degrees of Freedom = 5 params)
+    if(out->test_statistic < 0) out->test_statistic = 0;
     out->p_value = chi2_p_value(out->test_statistic, 5);
-    
-    // 7. Decision (Significance Level 0.05)
     out->is_significant = (out->p_value < 0.05) ? 1 : 0;
-}
-
-// Analytic Greeks
-double norm_pdf(double x) { return (1.0/SQRT_2PI)*exp(-0.5*x*x); }
-double norm_cdf(double x) { return 0.5 * erfc(-x * M_SQRT1_2); }
-
-void calc_svcj_greeks(double s0, double K, double T, double r, SVCJParams* p, double spot_vol, int type, SVCJGreeks* out) {
-    double lambda = p->lambda_j; double m = p->mu_j; double v_j = p->sigma_j;
-    double lamp = lambda * (1.0 + m);
-    out->delta = 0; out->gamma = 0; out->vega = 0;
-    for(int k=0; k<15; k++) {
-        double fact=1.0; for(int j=1;j<=k;j++) fact*=j;
-        double prob = exp(-lamp*T)*pow(lamp*T,k)/fact;
-        if(prob < 1e-9 && k>3) break;
-        double rk = r - lambda*m + (k*log(1.0+m))/T;
-        double vk = sqrt(spot_vol*spot_vol + (k*v_j*v_j)/T);
-        if(vk<1e-5) vk=1e-5;
-        double d1 = (log(s0/K) + (rk+0.5*vk*vk)*T)/(vk*sqrt(T));
-        double nd1 = norm_pdf(d1);
-        double bs_delta = (type==1) ? norm_cdf(d1) : norm_cdf(d1)-1.0;
-        double bs_gamma = nd1 / (s0*vk*sqrt(T));
-        double bs_vega  = s0 * nd1 * sqrt(T);
-        double dv_ds = spot_vol / vk; 
-        out->delta += prob*bs_delta;
-        out->gamma += prob*bs_gamma;
-        out->vega  += prob*bs_vega*dv_ds;
-    }
 }
