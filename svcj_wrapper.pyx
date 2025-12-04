@@ -3,110 +3,105 @@
 
 import numpy as np
 cimport numpy as np
-import pandas as pd # Used for time inference
+from cython.parallel import prange
 
 cdef extern from "svcj.h":
     ctypedef struct SVCJParams:
         double mu, kappa, theta, sigma_v, rho, lambda_j, mu_j, sigma_j
     ctypedef struct SVCJGreeks:
         double delta, gamma, vega, theta_decay
-
+    
     void optimize_svcj(double* ohlcv, int n, double dt, SVCJParams* p, double* sv, double* jp) nogil
     void calc_svcj_greeks(double s0, double K, double T, double r, SVCJParams* p, double v, int type, SVCJGreeks* out) nogil
     double ukf_log_likelihood(double* ret, int n, double dt, SVCJParams* p, double* sv, double* jp, double proxy) nogil
+    void compute_log_returns(double* ohlcv, int n_rows, double* out_returns) nogil
 
-# --- 1. Dynamic Time Inference ---
-def infer_dt_annualized(object index_obj):
-    """
-    Calculates annualized DT from a Pandas DatetimeIndex.
-    Handles Daily, Hourly, Minute data automatically.
-    """
-    if len(index_obj) < 2: return 1.0/252.0
-    
-    # Median diff in seconds
-    series = pd.Series(index_obj)
-    diffs = series.diff().dropna().dt.total_seconds()
-    median_sec = diffs.median()
-    
-    # Financial Year in Seconds (assuming 252 days * 6.5 hours trading)
-    # This aligns intraday volatility to annualized volatility
-    # Daily: 86400 raw? No, markets close. 
-    # Standard practice: Effective trading time per year ~ 252 * 24h (if crypto) or 252 * 6.5h (if stocks)
-    # SIMPLIFICATION: We map the observed frequency to fractions of 252 days.
-    
-    # If gap is > 20 hours (Daily data)
-    if median_sec > 70000: 
-        return 1.0/252.0
-    
-    # If gap is ~1 hour
-    if 3000 < median_sec < 4000:
-        return 1.0/(252.0 * 6.5) # Assuming 6.5h trading day
-        
-    # If gap is ~5 min (300 sec)
-    if 250 < median_sec < 350:
-        return 1.0/(252.0 * 78.0) # 78 5-min bars per day
-        
-    # Fallback: Ratio of seconds
-    seconds_per_trading_year = 252.0 * 6.5 * 60 * 60
-    return median_sec / seconds_per_trading_year
+cdef np.ndarray[double, ndim=2, mode='c'] _sanitize(object d):
+    return np.ascontiguousarray(np.asarray(d, dtype=np.float64))
 
-# --- 2. Standalone Structure Engine (No Options) ---
-def analyze_structure_standalone(object df_ohlcv, list windows):
+# --- Feature 1: Unified Unified Fit (Time Agnostic) ---
+def fit_and_filter(object ohlcv, double dt):
     """
-    Detects Regime Breaks using only OHLCV.
-    Returns: Tension Metrics, Parameters, Spot States.
+    Fits parameters and runs filter.
+    dt: Annualized time step (e.g. 1/252 for daily)
     """
-    # 1. Infer DT
-    cdef double dt = infer_dt_annualized(df_ohlcv.index)
-    
-    # 2. Prepare Data
-    cdef np.ndarray[double, ndim=2, mode='c'] data = np.ascontiguousarray(df_ohlcv.values, dtype=np.float64)
-    cdef int total_len = data.shape[0]
-    cdef int n_wins = len(windows)
-    
-    cdef np.ndarray[double, ndim=2] params_out = np.zeros((n_wins, 8))
-    cdef SVCJParams p
-    cdef int i, w_len, start
-    
-    # 3. Horizon Surface Analysis
-    for i in range(n_wins):
-        w_len = windows[i]
-        if w_len > total_len: continue
-        start = total_len - w_len
-        
-        # Optimize on specific window history
-        optimize_svcj(&data[start, 0], w_len, dt, &p, NULL, NULL)
-        
-        params_out[i, 0] = p.theta
-        params_out[i, 1] = p.kappa
-        params_out[i, 2] = p.sigma_v
-        params_out[i, 3] = p.lambda_j
-        params_out[i, 4] = p.rho
-        params_out[i, 5] = p.mu
-        
-    return {
-        "dt": dt,
-        "horizon_params": params_out # [Window, Param]
-    }
-
-# --- 3. Intraday Filter ---
-def run_filter(object prices, dict params, double dt):
-    """
-    Runs UKF on price array with fixed params and specific dt.
-    """
-    cdef np.ndarray[double, ndim=1, mode='c'] c_p = np.ascontiguousarray(prices, dtype=np.float64)
-    cdef int n = c_p.shape[0]
+    cdef np.ndarray[double, ndim=2, mode='c'] c_ohlcv = _sanitize(ohlcv)
+    cdef int n = c_ohlcv.shape[0]
     cdef int n_ret = n - 1
     
-    cdef np.ndarray[double, ndim=1] ret = np.diff(np.log(c_p))
+    cdef np.ndarray[double, ndim=1] spot_vol = np.zeros(n_ret)
+    cdef np.ndarray[double, ndim=1] jump_prob = np.zeros(n_ret)
+    cdef SVCJParams p
+    
+    optimize_svcj(&c_ohlcv[0, 0], n, dt, &p, &spot_vol[0], &jump_prob[0])
+    
+    return {
+        "params": {
+            "theta": p.theta, "kappa": p.kappa, "sigma_v": p.sigma_v,
+            "rho": p.rho, "lambda_j": p.lambda_j
+        },
+        "spot_vol": spot_vol,
+        "jump_prob": jump_prob
+    }
+
+# --- Feature 2: Dynamic Surface Tension (Gradient Detection) ---
+def analyze_multiscale_gradient(object ohlcv, double dt):
+    """
+    Auto-detects surface breaking by fitting on Log-Scale windows.
+    Returns [WindowSize, Theta] matrix.
+    """
+    cdef np.ndarray[double, ndim=2, mode='c'] data = _sanitize(ohlcv)
+    cdef int total_len = data.shape[0]
+    
+    # Generate Log-Scale Windows down to 30
+    windows = []
+    curr = total_len
+    while curr >= 30:
+        windows.append(curr)
+        curr = int(curr / 1.5)
+    windows = windows[::-1] 
+    
+    cdef int n_wins = len(windows)
+    cdef np.ndarray[double, ndim=2] res = np.zeros((n_wins, 2))
+    cdef SVCJParams p
+    cdef int i, w, start_idx
+    
+    for i in range(n_wins):
+        w = windows[i]
+        start_idx = total_len - w
+        # Fit on this window slice
+        optimize_svcj(&data[start_idx, 0], w, dt, &p, NULL, NULL)
+        res[i, 0] = w
+        res[i, 1] = p.theta
+        
+    return res
+
+# --- Feature 3: Greeks ---
+def get_greeks(double s0, double K, double T, double r, dict params, double spot_vol, int type):
+    cdef SVCJParams p
+    p.lambda_j=params['lambda_j']; p.mu_j=params.get('mu_j', -0.05); 
+    p.sigma_j=params.get('sigma_j', 0.05); p.mu=r;
+    
+    cdef SVCJGreeks g
+    calc_svcj_greeks(s0, K, T, r, &p, spot_vol, type, &g)
+    return {"delta": g.delta, "gamma": g.gamma, "vega": g.vega}
+
+# --- Feature 4: Instantaneous Filter (No Re-Calib) ---
+def run_filter_fixed(object ohlcv, double dt, dict params):
+    cdef np.ndarray[double, ndim=2, mode='c'] c_ohlcv = _sanitize(ohlcv)
+    cdef int n = c_ohlcv.shape[0]
+    cdef int n_ret = n - 1
+    
+    cdef np.ndarray[double, ndim=1] ret = np.zeros(n_ret)
+    compute_log_returns(&c_ohlcv[0,0], n, &ret[0])
+    
     cdef np.ndarray[double, ndim=1] sv = np.zeros(n_ret)
     cdef np.ndarray[double, ndim=1] jp = np.zeros(n_ret)
     
     cdef SVCJParams p
-    p.mu=params['mu']; p.kappa=params['kappa']; p.theta=params['theta']
+    p.mu=0; p.kappa=params['kappa']; p.theta=params['theta']
     p.sigma_v=params['sigma_v']; p.rho=params['rho']; p.lambda_j=params['lambda_j']
-    p.mu_j=params.get('mu_j',0); p.sigma_j=params.get('sigma_j',0.05)
+    p.mu_j=params.get('mu_j', -0.05); p.sigma_j=params.get('sigma_j', 0.05)
     
     ukf_log_likelihood(&ret[0], n_ret, dt, &p, &sv[0], &jp[0], p.theta)
-    
     return {"spot_vol": sv, "jump_prob": jp}
