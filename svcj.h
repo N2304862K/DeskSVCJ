@@ -6,10 +6,10 @@
 #include <stdio.h>
 #include <string.h>
 
-// Tuning Constants
-#define NM_ITER 250
+// Configuration
+#define NM_ITER 150
 #define SQRT_2PI 2.50662827463
-#define N_COLS 5 // OHLCV
+#define N_COLS 5
 
 // Data Structures
 typedef struct {
@@ -21,11 +21,11 @@ typedef struct {
 } SVCJGreeks;
 
 typedef struct {
-    double slope;       // Gradient of Theta vs Log-Time
-    double curvature;   // Convexity
+    double slope;       // Gradient of Theta vs Log-Time (Term Structure)
+    double curvature;   // Convexity of the Term Structure
     double short_term_theta;
     double long_term_theta;
-    double coherence_score;
+    double coherence_score; // Fit quality (R-squared of the structure)
 } TermStructStats;
 
 // Core Functions
