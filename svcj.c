@@ -127,17 +127,24 @@ void optimize_svcj(double* ohlcv, int n, double dt, SVCJParams* p, double* out_s
     free(ret);
 }
 
-// --- Fidelity Engine ---
+// --- Fidelity Engine with Physics Export ---
 void run_fidelity_scan(double* ohlcv, int total_len, double dt, FidelityMetrics* out) {
-    int win_impulse = 30; // Stat minimum
-    int win_gravity = win_impulse * 4; // Frequency Separation Rule
+    int win_impulse = 30; 
+    int win_gravity = win_impulse * 4;
     
     if (total_len < win_gravity) { out->is_valid=0; return; }
     
-    // 1. Fit Gravity (Stable)
+    // 1. Fit Gravity (Stable Structure)
     SVCJParams p_grav;
     int start_grav = total_len - win_gravity;
     optimize_svcj(ohlcv + start_grav*N_COLS, win_gravity, dt, &p_grav, NULL, NULL);
+    
+    // **EXPORT PHYSICS FOR COHERENCE**
+    out->fit_theta = p_grav.theta;
+    out->fit_kappa = p_grav.kappa;
+    out->fit_sigma_v = p_grav.sigma_v;
+    out->fit_rho = p_grav.rho;
+    out->fit_lambda = p_grav.lambda_j;
     
     // 2. Fit Impulse (Kinetic)
     SVCJParams p_imp;
@@ -148,7 +155,7 @@ void run_fidelity_scan(double* ohlcv, int total_len, double dt, FidelityMetrics*
     double kinetic = imp_spot[win_impulse-2];
     out->energy_ratio = (kinetic * kinetic) / p_grav.theta;
     
-    // 3. Direction (Residue Bias)
+    // 3. Direction
     double* ret = malloc((win_impulse-1)*sizeof(double));
     compute_log_returns(ohlcv + start_imp*N_COLS, win_impulse, ret);
     double res_sum=0, res_sq=0;
@@ -163,12 +170,10 @@ void run_fidelity_scan(double* ohlcv, int total_len, double dt, FidelityMetrics*
     out->win_impulse = win_impulse;
     out->win_gravity = win_gravity;
     
-    // Tests
     out->f_p_value = f_test_prob(out->energy_ratio, win_impulse-1, win_gravity-1);
     double t_stat = (res_sum/(win_impulse-1)) / std_err;
     out->t_p_value = t_test_prob(t_stat, win_impulse-2);
     
-    // Logic: F < 0.05 (Expansion) AND T < 0.10 (Direction)
     out->is_valid = (out->f_p_value < 0.05 && out->t_p_value < 0.10) ? 1 : 0;
     
     free(imp_spot); free(ret);
@@ -188,14 +193,12 @@ void run_instant_filter(double return_val, double dt, SVCJParams* p, double* sta
     
     out->innovation_z_score = y / total_std;
     
-    // State Update (Robust)
     double S = v_pred*dt + (p->lambda_j*dt*jump_var);
     double K = (p->rho*p->sigma_v*dt)/S;
     double v_new = v_pred + K*y;
     if(v_new<1e-9) v_new=1e-9;
     
     out->current_spot_vol = sqrt(v_new);
-    // Simple prob
     double pdf = (1.0/sqrt(2*M_PI*v_pred*dt))*exp(-0.5*y*y/(v_pred*dt));
     double pr = p->lambda_j*dt;
     out->current_jump_prob = pr / (pr + pdf*(1-pr));

@@ -12,6 +12,7 @@ cdef extern from "svcj.h":
     ctypedef struct FidelityMetrics:
         int win_impulse, win_gravity, is_valid
         double energy_ratio, residue_bias, f_p_value, t_p_value
+        double fit_theta, fit_kappa, fit_sigma_v, fit_rho, fit_lambda
     
     void run_fidelity_scan(double* ohlcv, int total_len, double dt, FidelityMetrics* out) nogil
     void run_instant_filter(double r, double dt, SVCJParams* p, double* state, InstantState* out) nogil
@@ -19,7 +20,6 @@ cdef extern from "svcj.h":
 cdef np.ndarray[double, ndim=2, mode='c'] _sanitize(object d):
     return np.ascontiguousarray(np.asarray(d, dtype=np.float64))
 
-# --- Fidelity Scanner ---
 def scan_fidelity(object ohlcv, double dt):
     cdef np.ndarray[double, ndim=2, mode='c'] data = _sanitize(ohlcv)
     cdef int n = data.shape[0]
@@ -34,10 +34,17 @@ def scan_fidelity(object ohlcv, double dt):
         "energy_ratio": m.energy_ratio,
         "residue_bias": m.residue_bias,
         "stats": {"f_p": m.f_p_value, "t_p": m.t_p_value},
-        "is_valid": bool(m.is_valid)
+        "is_valid": bool(m.is_valid),
+        # THE COHERENCE PAYLOAD: Returns the exact fitted physics
+        "params": {
+            "theta": m.fit_theta,
+            "kappa": m.fit_kappa,
+            "sigma_v": m.fit_sigma_v,
+            "rho": m.fit_rho,
+            "lambda_j": m.fit_lambda
+        }
     }
 
-# --- Instant Monitor ---
 cdef class SpotMonitor:
     cdef SVCJParams params
     cdef double state_variance
