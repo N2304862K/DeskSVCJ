@@ -6,8 +6,8 @@
 #include <stdio.h>
 #include <string.h>
 
-// Configuration
-#define NM_ITER 300 // Increased for convergence without priors
+// Config
+#define NM_ITER 300 
 #define SQRT_2PI 2.50662827463
 #define N_COLS 5
 
@@ -20,22 +20,23 @@ typedef struct {
 } SVCJGreeks;
 
 typedef struct {
-    double ll_null;      // Long Window (Null Hypothesis)
-    double ll_alt;       // Short Window (Alternative)
-    double statistic;    // D = 2 * (LL_alt - LL_null)
+    double ll_null;      // Pure Likelihood (Long Params)
+    double ll_alt;       // Pure Likelihood (Short Params)
+    double statistic;    // D
     double p_value;
     int significant;
 } RegimeStats;
 
-// Core
+// Utils
 void compute_log_returns(double* ohlcv, int n_rows, double* out_returns);
 
-// Optimization
+// Core
 void estimate_initial_params(double* ohlcv, int n, double dt, SVCJParams* p);
-double ukf_log_likelihood(double* returns, int n, double dt, SVCJParams* p, double* out_spot_vol, double* out_jump_prob);
+double ukf_pure_likelihood(double* returns, int n, double dt, SVCJParams* p, double* out_spot_vol, double* out_jump_prob);
+double objective_function(double* returns, int n, double dt, SVCJParams* p); // Likelihood + Soft Constraints
 void optimize_svcj(double* ohlcv, int n, double dt, SVCJParams* p, double* out_spot_vol, double* out_jump_prob);
 
-// Statistical Test
+// Test
 void perform_likelihood_test(double* ohlcv, int len_long, int len_short, double dt, RegimeStats* out);
 
 // Pricing
