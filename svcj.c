@@ -44,20 +44,29 @@ double ukf_pure_likelihood(double* returns, int n, double dt, SVCJParams* p, dou
     for(int t=0; t<n; t++) {
         double v_pred = v + p->kappa*(p->theta - v)*dt;
         if(v_pred < 1e-9) v_pred = 1e-9;
-        double y = returns[t] - (p->mu - 0.5*v_pred)*dt;
+        
+        double drift = (p->mu - 0.5*v_pred);
+        double y = returns[t] - drift*dt;
+
         double rob_var = (v_pred < 1e-9) ? 1e-9 : v_pred;
         rob_var *= dt;
         double pdf_d = (1.0/sqrt(rob_var*2*M_PI)) * exp(-0.5*y*y/rob_var);
+        
         double tot_j = rob_var + var_j; 
         double yj = y - p->mu_j;
         double pdf_j = (1.0/sqrt(tot_j*2*M_PI)) * exp(-0.5*yj*yj/tot_j);
-        double prior = (p->lambda_j * dt > 0.999) ? 0.999 : p->lambda_j * dt;
+        
+        double prior = p->lambda_j * dt;
+        if(prior > 0.999) prior = 0.999;
+        
         double den = pdf_j*prior + pdf_d*(1.0-prior);
         if(den < 1e-25) den = 1e-25;
         double post = (pdf_j*prior)/den;
+        
         double S = v_pred*dt + post*var_j;
         v = v_pred + (p->rho*p->sigma_v*dt/S)*y;
         if(v<1e-9)v=1e-9; if(v>100.0)v=100.0;
+        
         if(out_spot_vol) out_spot_vol[t]=sqrt(v_pred);
         if(out_jump_prob) out_jump_prob[t]=post;
         ll += log(den);
@@ -119,68 +128,53 @@ void optimize_svcj(double* ohlcv, int n, double dt, SVCJParams* p, double* out_s
     free(ret);
 }
 
-// --- FRACTAL STABILITY TEST (Regression on Physics) ---
-void perform_fractal_test(double* ohlcv, int total_len, double dt, FractalStats* out) {
-    // 1. Generate Log-Distributed Windows
-    // Max 8 points. Minimum window 30 bars.
-    int windows[8];
-    double thetas[8];
-    int count = 0;
+// --- Breakout Physics ---
+void calculate_breakout_physics(double* ohlcv, int len_long, int len_short, double dt, BreakoutStats* out) {
+    SVCJParams p_long, p_short;
     
-    double curr = (double)total_len;
-    while(curr >= 30.0 && count < 8) {
-        windows[count] = (int)curr;
-        curr /= 1.5; // Log step
-        count++;
+    // 1. Establish Structure (Gravity)
+    optimize_svcj(ohlcv, len_long, dt, &p_long, NULL, NULL);
+    
+    // 2. Establish State (Velocity)
+    // Fit on short window
+    int offset = len_long - len_short;
+    double* spot_vol = malloc((len_short-1)*sizeof(double));
+    optimize_svcj(ohlcv + offset*N_COLS, len_short, dt, &p_short, spot_vol, NULL);
+    
+    // 3. Calculate Force Metrics
+    // Energy Ratio: Current State / Structural Gravity
+    // High Ratio (>1.5) = Breakout. Low Ratio (<0.8) = Compression.
+    double current_kinetic = spot_vol[len_short-2]; // Last point
+    out->energy_ratio = (current_kinetic * current_kinetic) / p_long.theta;
+    
+    // Drift Impulse: Short Drift - Long Drift
+    // Positive = Upward acceleration relative to history
+    out->drift_impulse = p_short.mu - p_long.mu; 
+    
+    // Jump Dominance: Is the move driven by Jumps?
+    // High Lambda + High Impulse = Structural Break Up
+    out->jump_dominance = (p_short.lambda_j * p_short.sigma_j) / current_kinetic;
+    
+    // Residue Bias: Are realised returns consistently beating the Long model?
+    double* ret_short = malloc((len_short-1)*sizeof(double));
+    compute_log_returns(ohlcv + offset*N_COLS, len_short, ret_short);
+    double res_sum = 0;
+    for(int i=0; i<len_short-1; i++) {
+        // Realized - Structural Expectation
+        res_sum += ret_short[i] - (p_long.mu * dt);
+    }
+    out->residue_bias = res_sum;
+    
+    // Decision Logic (C-Level Speed)
+    // 1. Energy > 1.2 (Breaking Gravity)
+    // 2. Residue > 0 (Upward Direction)
+    // 3. Drift > 0 (Momentum Confirmed)
+    if (out->energy_ratio > 1.2 && out->residue_bias > 0 && out->drift_impulse > -0.01) {
+        out->is_breakout = 1;
+    } else {
+        out->is_breakout = 0;
     }
     
-    // 2. Fit Physics at each Scale
-    SVCJParams p;
-    double sum_theta = 0;
-    
-    for(int i=0; i<count; i++) {
-        int w = windows[i];
-        int start_idx = total_len - w;
-        // Fit slice
-        optimize_svcj(ohlcv + start_idx*N_COLS, w, dt, &p, NULL, NULL);
-        thetas[i] = p.theta;
-        sum_theta += p.theta;
-    }
-    
-    // 3. Statistical Regression: ln(Theta) ~ Alpha + Beta * ln(Window)
-    // If Beta (Slope) is significant, there is a Trend.
-    // If R^2 is high, the structure is Fractal (Stable).
-    // If R^2 is low, the structure is Broken.
-    
-    double sum_x=0, sum_y=0, sum_xy=0, sum_x2=0;
-    for(int i=0; i<count; i++) {
-        double x = log((double)windows[i]);
-        double y = log(thetas[i]); // Log-Log Space
-        sum_x += x; sum_y += y;
-        sum_xy += x*y; sum_x2 += x*x;
-    }
-    
-    double slope = (count*sum_xy - sum_x*sum_y) / (count*sum_x2 - sum_x*sum_x);
-    double intercept = (sum_y - slope*sum_x) / count;
-    
-    // Calc R^2 and Std Error
-    double ss_tot = 0, ss_res = 0;
-    double y_mean = sum_y / count;
-    
-    for(int i=0; i<count; i++) {
-        double x = log((double)windows[i]);
-        double y = log(thetas[i]);
-        double y_pred = intercept + slope*x;
-        ss_res += (y - y_pred)*(y - y_pred);
-        ss_tot += (y - y_mean)*(y - y_mean);
-    }
-    
-    double r2 = 1.0 - (ss_res / ss_tot);
-    double std_err = sqrt(ss_res / (count - 2)) / sqrt(sum_x2 - (sum_x*sum_x)/count);
-    
-    out->slope = slope;
-    out->intercept = intercept;
-    out->r_squared = r2;
-    out->std_error = std_err;
-    out->mean_theta = sum_theta / count;
+    free(spot_vol);
+    free(ret_short);
 }
