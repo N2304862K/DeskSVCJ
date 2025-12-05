@@ -134,19 +134,17 @@ void run_fidelity_scan(double* ohlcv, int total_len, double dt, FidelityMetrics*
     
     if (total_len < win_gravity) { out->is_valid=0; return; }
     
-    // 1. Fit Gravity (Stable Structure)
     SVCJParams p_grav;
     int start_grav = total_len - win_gravity;
     optimize_svcj(ohlcv + start_grav*N_COLS, win_gravity, dt, &p_grav, NULL, NULL);
     
-    // **EXPORT PHYSICS FOR COHERENCE**
+    // EXPORT PHYSICS
     out->fit_theta = p_grav.theta;
     out->fit_kappa = p_grav.kappa;
     out->fit_sigma_v = p_grav.sigma_v;
     out->fit_rho = p_grav.rho;
     out->fit_lambda = p_grav.lambda_j;
     
-    // 2. Fit Impulse (Kinetic)
     SVCJParams p_imp;
     double* imp_spot = malloc((win_impulse-1)*sizeof(double));
     int start_imp = total_len - win_impulse;
@@ -155,7 +153,6 @@ void run_fidelity_scan(double* ohlcv, int total_len, double dt, FidelityMetrics*
     double kinetic = imp_spot[win_impulse-2];
     out->energy_ratio = (kinetic * kinetic) / p_grav.theta;
     
-    // 3. Direction
     double* ret = malloc((win_impulse-1)*sizeof(double));
     compute_log_returns(ohlcv + start_imp*N_COLS, win_impulse, ret);
     double res_sum=0, res_sq=0;
@@ -167,9 +164,6 @@ void run_fidelity_scan(double* ohlcv, int total_len, double dt, FidelityMetrics*
     double std_err = sqrt(res_var/(win_impulse-1));
     
     out->residue_bias = res_sum;
-    out->win_impulse = win_impulse;
-    out->win_gravity = win_gravity;
-    
     out->f_p_value = f_test_prob(out->energy_ratio, win_impulse-1, win_gravity-1);
     double t_stat = (res_sum/(win_impulse-1)) / std_err;
     out->t_p_value = t_test_prob(t_stat, win_impulse-2);
@@ -179,7 +173,6 @@ void run_fidelity_scan(double* ohlcv, int total_len, double dt, FidelityMetrics*
     free(imp_spot); free(ret);
 }
 
-// --- Instant Filter ---
 void run_instant_filter(double return_val, double dt, SVCJParams* p, double* state_var, InstantState* out) {
     double v_curr = *state_var;
     double v_pred = v_curr + p->kappa*(p->theta - v_curr)*dt;

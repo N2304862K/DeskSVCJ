@@ -21,16 +21,14 @@ typedef struct {
 } InstantState;
 
 typedef struct {
-    // Metrics
+    // Signals
     double energy_ratio;
     double residue_bias;
     double f_p_value;
     double t_p_value;
     int is_valid;
-    int win_impulse;
-    int win_gravity;
     
-    // The Physics Export (Coherence Link)
+    // Physics Payload (To initialize Monitors)
     double fit_theta;
     double fit_kappa;
     double fit_sigma_v;
@@ -38,14 +36,9 @@ typedef struct {
     double fit_lambda;
 } FidelityMetrics;
 
-// Core
 void compute_log_returns(double* ohlcv, int n_rows, double* out_returns);
-
-// Optimization
 void estimate_initial_params(double* ohlcv, int n, double dt, SVCJParams* p);
 void optimize_svcj(double* ohlcv, int n, double dt, SVCJParams* p, double* out_spot_vol, double* out_jump_prob);
-
-// Engines
 void run_fidelity_scan(double* ohlcv, int total_len, double dt, FidelityMetrics* out);
 void run_instant_filter(double return_val, double dt, SVCJParams* p, double* state_var, InstantState* out);
 

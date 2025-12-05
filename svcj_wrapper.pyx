@@ -3,6 +3,8 @@
 
 import numpy as np
 cimport numpy as np
+from libc.stdlib cimport malloc, free
+from cython.parallel import prange
 
 cdef extern from "svcj.h":
     ctypedef struct SVCJParams:
@@ -10,8 +12,8 @@ cdef extern from "svcj.h":
     ctypedef struct InstantState:
         double current_spot_vol, current_jump_prob, innovation_z_score
     ctypedef struct FidelityMetrics:
-        int win_impulse, win_gravity, is_valid
         double energy_ratio, residue_bias, f_p_value, t_p_value
+        int is_valid
         double fit_theta, fit_kappa, fit_sigma_v, fit_rho, fit_lambda
     
     void run_fidelity_scan(double* ohlcv, int total_len, double dt, FidelityMetrics* out) nogil
@@ -20,31 +22,70 @@ cdef extern from "svcj.h":
 cdef np.ndarray[double, ndim=2, mode='c'] _sanitize(object d):
     return np.ascontiguousarray(np.asarray(d, dtype=np.float64))
 
-def scan_fidelity(object ohlcv, double dt):
-    cdef np.ndarray[double, ndim=2, mode='c'] data = _sanitize(ohlcv)
-    cdef int n = data.shape[0]
-    if n < 120: return None
+# --- MARKET SCALE ENGINE ---
+def scan_market_batch(object tensor_3d, double dt):
+    """
+    Input: (Assets, Time, 5) Tensor
+    Output: Dictionary of Vectorized Results (aligned by Asset Index)
+    """
+    cdef np.ndarray[double, ndim=3, mode='c'] data = np.ascontiguousarray(tensor_3d, dtype=np.float64)
+    cdef int n_assets = data.shape[0]
+    cdef int n_bars = data.shape[1]
     
-    cdef FidelityMetrics m
+    # Pre-allocate C-Struct Array for results
+    cdef FidelityMetrics* results = <FidelityMetrics*> malloc(n_assets * sizeof(FidelityMetrics))
+    
+    # 1. Parallel Execution (GIL Released)
+    # The 'Physics' of every asset is solved independently on separate cores
+    cdef int i
     with nogil:
-        run_fidelity_scan(&data[0,0], n, dt, &m)
+        for i in prange(n_assets, schedule='dynamic'):
+            # Pass pointer to the start of this asset's OHLCV block
+            # data[i, 0, 0] is the address
+            run_fidelity_scan(&data[i, 0, 0], n_bars, dt, &results[i])
+            
+    # 2. Unpack to Python (Vectorized)
+    # We construct arrays to return clean columns for a DataFrame
+    cdef np.ndarray[double, ndim=1] energy = np.zeros(n_assets)
+    cdef np.ndarray[double, ndim=1] bias = np.zeros(n_assets)
+    cdef np.ndarray[double, ndim=1] fp = np.zeros(n_assets)
+    cdef np.ndarray[double, ndim=1] tp = np.zeros(n_assets)
+    cdef np.ndarray[int, ndim=1] valid = np.zeros(n_assets, dtype=np.int32)
+    
+    # Physics Payload Arrays
+    cdef np.ndarray[double, ndim=1] theta = np.zeros(n_assets)
+    cdef np.ndarray[double, ndim=1] kappa = np.zeros(n_assets)
+    cdef np.ndarray[double, ndim=1] sigma_v = np.zeros(n_assets)
+    cdef np.ndarray[double, ndim=1] rho = np.zeros(n_assets)
+    cdef np.ndarray[double, ndim=1] lam = np.zeros(n_assets)
+    
+    for i in range(n_assets):
+        energy[i] = results[i].energy_ratio
+        bias[i] = results[i].residue_bias
+        fp[i] = results[i].f_p_value
+        tp[i] = results[i].t_p_value
+        valid[i] = results[i].is_valid
         
+        theta[i] = results[i].fit_theta
+        kappa[i] = results[i].fit_kappa
+        sigma_v[i] = results[i].fit_sigma_v
+        rho[i] = results[i].fit_rho
+        lam[i] = results[i].fit_lambda
+        
+    free(results)
+    
     return {
-        "windows": (m.win_impulse, m.win_gravity),
-        "energy_ratio": m.energy_ratio,
-        "residue_bias": m.residue_bias,
-        "stats": {"f_p": m.f_p_value, "t_p": m.t_p_value},
-        "is_valid": bool(m.is_valid),
-        # THE COHERENCE PAYLOAD: Returns the exact fitted physics
+        "energy_ratio": energy,
+        "residue_bias": bias,
+        "f_p_value": fp,
+        "t_p_value": tp,
+        "is_valid": valid,
         "params": {
-            "theta": m.fit_theta,
-            "kappa": m.fit_kappa,
-            "sigma_v": m.fit_sigma_v,
-            "rho": m.fit_rho,
-            "lambda_j": m.fit_lambda
+            "theta": theta, "kappa": kappa, "sigma_v": sigma_v, "rho": rho, "lambda": lam
         }
     }
 
+# --- Instant Monitor (For Selected Assets) ---
 cdef class SpotMonitor:
     cdef SVCJParams params
     cdef double state_variance
