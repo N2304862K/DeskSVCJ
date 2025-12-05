@@ -5,38 +5,84 @@ import numpy as np
 cimport numpy as np
 
 cdef extern from "svcj.h":
-    ctypedef struct BreakoutStats:
-        double energy_ratio, drift_impulse, jump_dominance, residue_bias
-        int is_breakout
+    ctypedef struct SpectralPoint:
+        int window_len
+        double theta, spot_vol, residue_sum
     
-    void calculate_breakout_physics(double* ohlcv, int len_long, int len_short, double dt, BreakoutStats* out) nogil
+    void run_spectral_scan(double* ohlcv, int total_len, int* windows, int n_windows, double dt, SpectralPoint* out) nogil
 
 cdef np.ndarray[double, ndim=2, mode='c'] _sanitize(object d):
     return np.ascontiguousarray(np.asarray(d, dtype=np.float64))
 
-def analyze_breakout_force(object ohlcv, int win_long, int win_short, double dt):
+def analyze_physics_spectrum(object ohlcv, double dt):
     """
-    Calculates Breakout Physics (Energy, Drift, Direction).
-    Target: Identify Upward Structural Breaks.
+    1. Generates log-scale windows based on data length.
+    2. Scans physics for all windows.
+    3. Identifies 'Gravity Wall' (Stable Theta) and 'Impulse' (Kinetic).
     """
     cdef np.ndarray[double, ndim=2, mode='c'] data = _sanitize(ohlcv)
     cdef int n = data.shape[0]
     
-    # Handle lengths
-    if n < win_long: win_long = n
-    if win_long < win_short + 10: 
-        # Fallback if data very short
-        return None 
-        
-    cdef int start_idx = n - win_long
-    cdef BreakoutStats s
+    # 1. Generate Log-Scale Windows (Python List -> C Array)
+    # Start small (30), go up to N, step 1.4
+    win_list = []
+    curr = 30.0
+    while curr <= n:
+        win_list.append(int(curr))
+        curr *= 1.4
     
-    calculate_breakout_physics(&data[start_idx, 0], win_long, win_short, dt, &s)
+    if not win_list: return None # Data too short
+    
+    cdef int n_wins = len(win_list)
+    cdef np.ndarray[int, ndim=1, mode='c'] c_wins = np.array(win_list, dtype=np.int32)
+    cdef np.ndarray[double, ndim=2] res_matrix = np.zeros((n_wins, 4)) # [Len, Theta, Spot, Residue]
+    
+    # Create C-Struct Array wrapper
+    # We allocate memory in Python to pass to C? No, C output is array of structs.
+    # Actually, simpler to just map struct array to numpy in Cython after call.
+    cdef SpectralPoint* results = <SpectralPoint*> malloc(n_wins * sizeof(SpectralPoint))
+    
+    try:
+        run_spectral_scan(&data[0,0], n, &c_wins[0], n_wins, dt, results)
+        
+        # 2. Extract Results to Python
+        points = []
+        for i in range(n_wins):
+            points.append({
+                "window": results[i].window_len,
+                "theta": results[i].theta,
+                "spot": results[i].spot_vol,
+                "residue": results[i].residue_sum
+            })
+    finally:
+        free(results)
+        
+    # 3. Find Gravity Wall (Data-Derived Logic)
+    # Gravity = The window where Theta changes least relative to neighbors.
+    # (Plateau in the Theta vs Window curve)
+    
+    # Calculate gradient of theta
+    thetas = np.array([p['theta'] for p in points])
+    grads = np.abs(np.gradient(thetas))
+    
+    # Find index of min gradient (Most stable structure)
+    gravity_idx = np.argmin(grads)
+    gravity_point = points[gravity_idx]
+    
+    # 4. Find Impulse (Shortest valid window)
+    impulse_point = points[0]
+    
+    # 5. Calculate Physics
+    energy_ratio = (impulse_point['spot']**2) / gravity_point['theta']
+    bias = impulse_point['residue']
     
     return {
-        "energy_ratio": s.energy_ratio,
-        "drift_impulse": s.drift_impulse,
-        "jump_dominance": s.jump_dominance,
-        "residue_bias": s.residue_bias,
-        "is_breakout": bool(s.is_breakout)
+        "gravity_window": gravity_point['window'],
+        "gravity_theta": gravity_point['theta'],
+        "impulse_window": impulse_point['window'],
+        "energy_ratio": energy_ratio,
+        "residue_bias": bias,
+        "is_breakout": (energy_ratio > 1.2 and bias > 0)
     }
+
+from libc.stdlib cimport malloc, free

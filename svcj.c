@@ -33,7 +33,7 @@ void estimate_initial_params(double* ohlcv, int n, double dt, SVCJParams* p) {
     }
     double rv = (sum_gk / n) / dt;
     p->mu = 0.0; p->theta = rv;
-    p->kappa = 4.0; p->sigma_v = sqrt(rv); p->rho = -0.5;
+    p->kappa = 2.0; p->sigma_v = sqrt(rv); p->rho = -0.5;
     p->lambda_j = 0.5; p->mu_j = 0.0; p->sigma_j = sqrt(rv); 
     check_constraints(p);
 }
@@ -44,29 +44,21 @@ double ukf_pure_likelihood(double* returns, int n, double dt, SVCJParams* p, dou
     for(int t=0; t<n; t++) {
         double v_pred = v + p->kappa*(p->theta - v)*dt;
         if(v_pred < 1e-9) v_pred = 1e-9;
-        
-        double drift = (p->mu - 0.5*v_pred);
-        double y = returns[t] - drift*dt;
-
+        double y = returns[t] - (p->mu - 0.5*v_pred)*dt;
         double rob_var = (v_pred < 1e-9) ? 1e-9 : v_pred;
         rob_var *= dt;
         double pdf_d = (1.0/sqrt(rob_var*2*M_PI)) * exp(-0.5*y*y/rob_var);
-        
         double tot_j = rob_var + var_j; 
         double yj = y - p->mu_j;
         double pdf_j = (1.0/sqrt(tot_j*2*M_PI)) * exp(-0.5*yj*yj/tot_j);
-        
         double prior = p->lambda_j * dt;
         if(prior > 0.999) prior = 0.999;
-        
         double den = pdf_j*prior + pdf_d*(1.0-prior);
         if(den < 1e-25) den = 1e-25;
         double post = (pdf_j*prior)/den;
-        
         double S = v_pred*dt + post*var_j;
         v = v_pred + (p->rho*p->sigma_v*dt/S)*y;
         if(v<1e-9)v=1e-9; if(v>100.0)v=100.0;
-        
         if(out_spot_vol) out_spot_vol[t]=sqrt(v_pred);
         if(out_jump_prob) out_jump_prob[t]=post;
         ll += log(den);
@@ -128,53 +120,38 @@ void optimize_svcj(double* ohlcv, int n, double dt, SVCJParams* p, double* out_s
     free(ret);
 }
 
-// --- Breakout Physics ---
-void calculate_breakout_physics(double* ohlcv, int len_long, int len_short, double dt, BreakoutStats* out) {
-    SVCJParams p_long, p_short;
+// --- The Spectral Engine ---
+void run_spectral_scan(double* ohlcv, int total_len, int* windows, int n_windows, double dt, SpectralPoint* out) {
+    SVCJParams p;
     
-    // 1. Establish Structure (Gravity)
-    optimize_svcj(ohlcv, len_long, dt, &p_long, NULL, NULL);
-    
-    // 2. Establish State (Velocity)
-    // Fit on short window
-    int offset = len_long - len_short;
-    double* spot_vol = malloc((len_short-1)*sizeof(double));
-    optimize_svcj(ohlcv + offset*N_COLS, len_short, dt, &p_short, spot_vol, NULL);
-    
-    // 3. Calculate Force Metrics
-    // Energy Ratio: Current State / Structural Gravity
-    // High Ratio (>1.5) = Breakout. Low Ratio (<0.8) = Compression.
-    double current_kinetic = spot_vol[len_short-2]; // Last point
-    out->energy_ratio = (current_kinetic * current_kinetic) / p_long.theta;
-    
-    // Drift Impulse: Short Drift - Long Drift
-    // Positive = Upward acceleration relative to history
-    out->drift_impulse = p_short.mu - p_long.mu; 
-    
-    // Jump Dominance: Is the move driven by Jumps?
-    // High Lambda + High Impulse = Structural Break Up
-    out->jump_dominance = (p_short.lambda_j * p_short.sigma_j) / current_kinetic;
-    
-    // Residue Bias: Are realised returns consistently beating the Long model?
-    double* ret_short = malloc((len_short-1)*sizeof(double));
-    compute_log_returns(ohlcv + offset*N_COLS, len_short, ret_short);
-    double res_sum = 0;
-    for(int i=0; i<len_short-1; i++) {
-        // Realized - Structural Expectation
-        res_sum += ret_short[i] - (p_long.mu * dt);
+    for(int i=0; i<n_windows; i++) {
+        int w = windows[i];
+        if (w > total_len) w = total_len; // Safety
+        
+        // Point to the end (Most recent w bars)
+        int start_idx = total_len - w;
+        
+        // Allocate temp buffers for state
+        double* spot = malloc((w-1)*sizeof(double));
+        
+        // Optimize
+        optimize_svcj(ohlcv + start_idx*N_COLS, w, dt, &p, spot, NULL);
+        
+        // Calculate Residue Sum (Directional Bias)
+        double* ret = malloc((w-1)*sizeof(double));
+        compute_log_returns(ohlcv + start_idx*N_COLS, w, ret);
+        double res_sum = 0;
+        for(int k=0; k<w-1; k++) {
+            res_sum += ret[k]; // Simple return sum vs 0 drift assumption
+        }
+        
+        // Store Results
+        out[i].window_len = w;
+        out[i].theta = p.theta;
+        out[i].spot_vol = spot[w-2]; // Last fitted spot
+        out[i].residue_sum = res_sum;
+        
+        free(spot);
+        free(ret);
     }
-    out->residue_bias = res_sum;
-    
-    // Decision Logic (C-Level Speed)
-    // 1. Energy > 1.2 (Breaking Gravity)
-    // 2. Residue > 0 (Upward Direction)
-    // 3. Drift > 0 (Momentum Confirmed)
-    if (out->energy_ratio > 1.2 && out->residue_bias > 0 && out->drift_impulse > -0.01) {
-        out->is_breakout = 1;
-    } else {
-        out->is_breakout = 0;
-    }
-    
-    free(spot_vol);
-    free(ret_short);
 }
