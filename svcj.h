@@ -7,31 +7,38 @@
 #include <string.h>
 
 // Configuration
-#define MULTI_START_POINTS 5  // Number of random restarts to avoid local minima
-#define NM_ITER 300           // Deep iteration for accuracy
+#define NM_ITER 300 // Increased for convergence without priors
 #define SQRT_2PI 2.50662827463
 #define N_COLS 5
 
 typedef struct {
     double mu, kappa, theta, sigma_v, rho, lambda_j, mu_j, sigma_j;
-    double final_likelihood; // Store result quality
 } SVCJParams;
 
 typedef struct {
-    double ll_ratio;
+    double delta, gamma, vega, theta_decay;
+} SVCJGreeks;
+
+typedef struct {
+    double ll_null;      // Long Window (Null Hypothesis)
+    double ll_alt;       // Short Window (Alternative)
+    double statistic;    // D = 2 * (LL_alt - LL_null)
     double p_value;
-    double short_theta;
-    double long_theta;
-    double divergence;
-} SnapshotStats;
+    int significant;
+} RegimeStats;
 
-void compute_log_returns(double* ohlcv, int n, double* out);
+// Core
+void compute_log_returns(double* ohlcv, int n_rows, double* out_returns);
 
-// Core Logic
-double raw_log_likelihood(double* returns, int n, double dt, SVCJParams* p);
-void optimize_snapshot_raw(double* ohlcv, int n, double dt, SVCJParams* p);
+// Optimization
+void estimate_initial_params(double* ohlcv, int n, double dt, SVCJParams* p);
+double ukf_log_likelihood(double* returns, int n, double dt, SVCJParams* p, double* out_spot_vol, double* out_jump_prob);
+void optimize_svcj(double* ohlcv, int n, double dt, SVCJParams* p, double* out_spot_vol, double* out_jump_prob);
 
-// Pipeline
-void run_snapshot_test(double* ohlcv, int w_long, int w_short, double dt, SnapshotStats* out);
+// Statistical Test
+void perform_likelihood_test(double* ohlcv, int len_long, int len_short, double dt, RegimeStats* out);
+
+// Pricing
+void calc_greeks(double s0, double K, double T, double r, SVCJParams* p, double spot_vol, int type, SVCJGreeks* out);
 
 #endif

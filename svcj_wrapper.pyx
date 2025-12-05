@@ -6,51 +6,46 @@ cimport numpy as np
 
 cdef extern from "svcj.h":
     ctypedef struct SVCJParams:
-        double mu, kappa, theta, sigma_v, rho, lambda_j, mu_j, sigma_j
-    ctypedef struct SnapshotStats:
-        double ll_ratio, p_value, short_theta, long_theta, divergence
-
-    void optimize_snapshot_raw(double* ohlcv, int n, double dt, SVCJParams* p) nogil
-    void run_snapshot_test(double* ohlcv, int w_long, int w_short, double dt, SnapshotStats* out) nogil
+        double mu, kappa, theta, sigma_v, rho, lambda_j
+    ctypedef struct RegimeStats:
+        double ll_null, ll_alt, statistic, p_value
+        int significant
+    
+    void optimize_svcj(double* ohlcv, int n, double dt, SVCJParams* p, double* sv, double* jp) nogil
+    void perform_likelihood_test(double* ohlcv, int len_long, int len_short, double dt, RegimeStats* out) nogil
 
 cdef np.ndarray[double, ndim=2, mode='c'] _sanitize(object d):
     return np.ascontiguousarray(np.asarray(d, dtype=np.float64))
 
-def analyze_instant_snapshot(object ohlcv, int w_long, int w_short, double dt):
-    """
-    Runs the Multi-Start Snapshot Engine.
-    No Rolling. Fits NOW based on Long vs Short windows.
-    Returns statistical validity of the break.
-    """
+def fit_standalone(object ohlcv, double dt):
     cdef np.ndarray[double, ndim=2, mode='c'] data = _sanitize(ohlcv)
     cdef int n = data.shape[0]
-    if n < w_long: raise ValueError("Data too short")
-    
-    cdef SnapshotStats stats
-    cdef int start_idx = n - w_long
-    
-    # Run C-Core Pipeline
-    run_snapshot_test(&data[start_idx, 0], w_long, w_short, dt, &stats)
-    
-    return {
-        "p_value": stats.p_value,
-        "likelihood_ratio": stats.ll_ratio,
-        "divergence": stats.divergence,
-        "long_theta": stats.long_theta,
-        "short_theta": stats.short_theta
-    }
-
-def get_current_params(object ohlcv, double dt):
-    """
-    Returns the raw unconstrained parameters for the current window.
-    """
-    cdef np.ndarray[double, ndim=2, mode='c'] data = _sanitize(ohlcv)
-    cdef int n = data.shape[0]
+    cdef int n_ret = n - 1
+    cdef np.ndarray[double, ndim=1] sv = np.zeros(n_ret)
+    cdef np.ndarray[double, ndim=1] jp = np.zeros(n_ret)
     cdef SVCJParams p
     
-    optimize_snapshot_raw(&data[0,0], n, dt, &p)
+    optimize_svcj(&data[0,0], n, dt, &p, &sv[0], &jp[0])
     
     return {
-        "theta": p.theta, "lambda": p.lambda_j, "kappa": p.kappa, 
-        "sigma_v": p.sigma_v, "rho": p.rho
+        "params": {"theta": p.theta, "kappa": p.kappa, "sigma_v": p.sigma_v, "rho": p.rho, "lambda": p.lambda_j},
+        "spot_vol": sv,
+        "jump_prob": jp
+    }
+
+def test_regime_break(object ohlcv, int long_window, int short_window, double dt):
+    cdef np.ndarray[double, ndim=2, mode='c'] data = _sanitize(ohlcv)
+    cdef int n = data.shape[0]
+    # Use last N points
+    cdef int start = n - long_window
+    if start < 0: raise ValueError("Data too short")
+    
+    cdef RegimeStats s
+    perform_likelihood_test(&data[start,0], long_window, short_window, dt, &s)
+    
+    return {
+        "stat": s.statistic,
+        "p_value": s.p_value,
+        "significant": bool(s.significant),
+        "ll_ratio": s.ll_null / s.ll_alt
     }
