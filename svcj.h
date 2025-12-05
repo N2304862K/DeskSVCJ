@@ -6,7 +6,8 @@
 #include <stdio.h>
 #include <string.h>
 
-#define NM_ITER 250
+#define NM_ITER 300
+#define SQRT_2PI 2.50662827463
 #define N_COLS 5
 
 typedef struct {
@@ -14,36 +15,32 @@ typedef struct {
 } SVCJParams;
 
 typedef struct {
-    int window;
-    double sigma_v;      // The Stability Metric
-    double theta;        // The Structural Vol
-} VoVPoint;
+    double current_spot_vol;
+    double current_jump_prob;
+    double innovation_z_score;
+} InstantState;
 
 typedef struct {
-    // Physics
-    int win_impulse;
-    int win_gravity;
     double energy_ratio;
     double residue_bias;
-    
-    // Statistical Tests
-    double f_p_value;    // Energy Significance
-    double t_p_value;    // Direction Significance
-    double lb_p_value;   // Autocorrelation Significance (Momentum Validity)
-    double lb_stat;
-    
+    double f_p_value;
+    double t_p_value;
     int is_valid;
+    int win_impulse;
+    int win_gravity;
 } FidelityMetrics;
 
-// Utils
+// Core
 void compute_log_returns(double* ohlcv, int n_rows, double* out_returns);
 
-// Core
+// Optimization
 void estimate_initial_params(double* ohlcv, int n, double dt, SVCJParams* p);
 void optimize_svcj(double* ohlcv, int n, double dt, SVCJParams* p, double* out_spot_vol, double* out_jump_prob);
 
-// New Engines
-void run_vov_scan(double* ohlcv, int total_len, double dt, int step, VoVPoint* out_buffer, int max_steps);
-void run_fidelity_check(double* ohlcv, int total_len, int win_grav, int win_imp, double dt, FidelityMetrics* out);
+// Fidelity Engine
+void run_fidelity_scan(double* ohlcv, int total_len, double dt, FidelityMetrics* out);
+
+// Instant Filter
+void run_instant_filter(double return_val, double dt, SVCJParams* p, double* state_var, InstantState* out);
 
 #endif
