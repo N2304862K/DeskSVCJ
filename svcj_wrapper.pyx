@@ -4,88 +4,84 @@
 import numpy as np
 cimport numpy as np
 from libc.stdlib cimport malloc, free
-from cython.parallel import prange
 
 cdef extern from "svcj.h":
     ctypedef struct SVCJParams:
         double mu, kappa, theta, sigma_v, rho, lambda_j, mu_j, sigma_j
     ctypedef struct InstantState:
         double current_spot_vol, current_jump_prob, innovation_z_score
+    ctypedef struct VoVPoint:
+        int window
+        double sigma_v, theta
     ctypedef struct FidelityMetrics:
-        double energy_ratio, residue_bias, f_p_value, t_p_value
-        int is_valid
+        int win_impulse, win_gravity, is_valid
+        double energy_ratio, residue_bias, f_p_value, t_p_value, lb_p_value
         double fit_theta, fit_kappa, fit_sigma_v, fit_rho, fit_lambda
+    ctypedef struct SVCJGreeks:
+        double delta, gamma, vega
     
-    void run_fidelity_scan(double* ohlcv, int total_len, double dt, FidelityMetrics* out) nogil
+    void run_vov_scan(double* ohlcv, int total_len, double dt, int step, VoVPoint* out_buffer, int max_steps) nogil
+    void run_fidelity_check(double* ohlcv, int total_len, int win_grav, int win_imp, double dt, FidelityMetrics* out) nogil
     void run_instant_filter(double r, double dt, SVCJParams* p, double* state, InstantState* out) nogil
+    void calc_greeks(double s0, double K, double T, double r, SVCJParams* p, double v, int type, SVCJGreeks* out) nogil
 
 cdef np.ndarray[double, ndim=2, mode='c'] _sanitize(object d):
     return np.ascontiguousarray(np.asarray(d, dtype=np.float64))
 
-# --- MARKET SCALE ENGINE ---
-def scan_market_batch(object tensor_3d, double dt):
-    """
-    Input: (Assets, Time, 5) Tensor
-    Output: Dictionary of Vectorized Results (aligned by Asset Index)
-    """
-    cdef np.ndarray[double, ndim=3, mode='c'] data = np.ascontiguousarray(tensor_3d, dtype=np.float64)
-    cdef int n_assets = data.shape[0]
-    cdef int n_bars = data.shape[1]
+# --- VoV Spectrum Orchestrator ---
+def scan_fidelity_spectrum(object ohlcv, double dt):
+    cdef np.ndarray[double, ndim=2, mode='c'] data = _sanitize(ohlcv)
+    cdef int n = data.shape[0]
+    if n < 100: return None
     
-    # Pre-allocate C-Struct Array for results
-    cdef FidelityMetrics* results = <FidelityMetrics*> malloc(n_assets * sizeof(FidelityMetrics))
+    # 1. Run VoV Scan
+    cdef int step = 5
+    cdef int max_steps = int((n - 30) / step) + 2
+    cdef VoVPoint* buf = <VoVPoint*> malloc(max_steps * sizeof(VoVPoint))
     
-    # 1. Parallel Execution (GIL Released)
-    # The 'Physics' of every asset is solved independently on separate cores
-    cdef int i
     with nogil:
-        for i in prange(n_assets, schedule='dynamic'):
-            # Pass pointer to the start of this asset's OHLCV block
-            # data[i, 0, 0] is the address
-            run_fidelity_scan(&data[i, 0, 0], n_bars, dt, &results[i])
-            
-    # 2. Unpack to Python (Vectorized)
-    # We construct arrays to return clean columns for a DataFrame
-    cdef np.ndarray[double, ndim=1] energy = np.zeros(n_assets)
-    cdef np.ndarray[double, ndim=1] bias = np.zeros(n_assets)
-    cdef np.ndarray[double, ndim=1] fp = np.zeros(n_assets)
-    cdef np.ndarray[double, ndim=1] tp = np.zeros(n_assets)
-    cdef np.ndarray[int, ndim=1] valid = np.zeros(n_assets, dtype=np.int32)
-    
-    # Physics Payload Arrays
-    cdef np.ndarray[double, ndim=1] theta = np.zeros(n_assets)
-    cdef np.ndarray[double, ndim=1] kappa = np.zeros(n_assets)
-    cdef np.ndarray[double, ndim=1] sigma_v = np.zeros(n_assets)
-    cdef np.ndarray[double, ndim=1] rho = np.zeros(n_assets)
-    cdef np.ndarray[double, ndim=1] lam = np.zeros(n_assets)
-    
-    for i in range(n_assets):
-        energy[i] = results[i].energy_ratio
-        bias[i] = results[i].residue_bias
-        fp[i] = results[i].f_p_value
-        tp[i] = results[i].t_p_value
-        valid[i] = results[i].is_valid
+        run_vov_scan(&data[0,0], n, dt, step, buf, max_steps)
         
-        theta[i] = results[i].fit_theta
-        kappa[i] = results[i].fit_kappa
-        sigma_v[i] = results[i].fit_sigma_v
-        rho[i] = results[i].fit_rho
-        lam[i] = results[i].fit_lambda
-        
-    free(results)
+    # Find Natural Frequency (Min Sigma_V) in Python for flexibility
+    windows = []
+    sigmas = []
+    cdef int i
+    for i in range(max_steps):
+        if buf[i].window == 0: break
+        windows.append(buf[i].window)
+        sigmas.append(buf[i].sigma_v)
+    free(buf)
+    
+    if not sigmas: return None
+    
+    # Simple Min Find
+    min_idx = np.argmin(sigmas)
+    natural_window = windows[min_idx]
+    
+    # 2. Run Fidelity Check
+    cdef FidelityMetrics m
+    # Fixed Impulse window 30
+    run_fidelity_check(&data[0,0], n, natural_window, 30, dt, &m)
     
     return {
-        "energy_ratio": energy,
-        "residue_bias": bias,
-        "f_p_value": fp,
-        "t_p_value": tp,
-        "is_valid": valid,
+        "natural_window": natural_window,
+        "energy_ratio": m.energy_ratio,
+        "residue_bias": m.residue_bias,
+        "is_valid": bool(m.is_valid),
+        "stats": {
+            "f_p": m.f_p_value, "t_p": m.t_p_value, "lb_p": m.lb_p_value
+        },
+        # EXPORT PHYSICS
         "params": {
-            "theta": theta, "kappa": kappa, "sigma_v": sigma_v, "rho": rho, "lambda": lam
+            "theta": m.fit_theta,
+            "kappa": m.fit_kappa,
+            "sigma_v": m.fit_sigma_v,
+            "rho": m.fit_rho,
+            "lambda_j": m.fit_lambda
         }
     }
 
-# --- Instant Monitor (For Selected Assets) ---
+# --- Instant Monitor ---
 cdef class SpotMonitor:
     cdef SVCJParams params
     cdef double state_variance
@@ -112,3 +108,11 @@ cdef class SpotMonitor:
             "spot_vol": out.current_spot_vol,
             "jump_prob": out.current_jump_prob
         }
+
+# --- Greeks ---
+def get_greeks(double s0, double K, double T, double r, dict params, double spot_vol, int type):
+    cdef SVCJParams p
+    p.lambda_j=params['lambda_j']; p.mu_j=-0.05; p.sigma_j=0.05; p.mu=r;
+    cdef SVCJGreeks g
+    calc_greeks(s0, K, T, r, &p, spot_vol, type, &g)
+    return {"delta": g.delta, "gamma": g.gamma, "vega": g.vega}

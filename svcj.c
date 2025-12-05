@@ -1,13 +1,14 @@
 #include "svcj.h"
 #include <float.h>
 
-// --- Stat Helpers ---
+// --- Statistical Functions ---
 double fast_erfc(double x) {
     double t = 1.0 / (1.0 + 0.5 * fabs(x));
     double tau = t * exp(-x*x - 1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))));
     return x >= 0 ? tau : 2.0 - tau;
 }
 double norm_cdf(double x) { return 0.5 * fast_erfc(-x * 0.70710678); }
+
 double f_test_prob(double f, int df1, int df2) {
     if (f <= 0) return 1.0;
     double a = 2.0/(9.0*df1); double b = 2.0/(9.0*df2);
@@ -16,23 +17,32 @@ double f_test_prob(double f, int df1, int df2) {
     return 2.0 * norm_cdf(-fabs(z));
 }
 double t_test_prob(double t, int df) { return 2.0 * norm_cdf(-fabs(t)); }
+double chi2_prob(double x, int k) {
+    if (x <= 0) return 1.0;
+    double s = 2.0/9.0/k;
+    double z = (pow(x/k, 1.0/3.0) - (1.0 - s)) / sqrt(s);
+    return 0.5 * erfc(z * 0.70710678);
+}
 
-// --- Core ---
+// --- Utils ---
 void compute_log_returns(double* ohlcv, int n_rows, double* out_returns) {
     for(int i=1; i<n_rows; i++) {
-        double prev = ohlcv[(i-1)*N_COLS+3]; double curr = ohlcv[i*N_COLS+3];
+        double prev = ohlcv[(i-1)*N_COLS + 3];
+        double curr = ohlcv[i*N_COLS + 3];
         if(prev < 1e-9) prev = 1e-9;
         out_returns[i-1] = log(curr/prev);
     }
 }
 
 void check_constraints(SVCJParams* p) {
+    // Soft constraints for extreme assets
     if(p->kappa<0.01) p->kappa=0.01; if(p->kappa>100.0) p->kappa=100.0;
     if(p->theta<1e-6) p->theta=1e-6; if(p->theta>50.0) p->theta=50.0;
     if(p->sigma_v<0.01) p->sigma_v=0.01; if(p->sigma_v>50.0) p->sigma_v=50.0;
     if(p->rho>0.999) p->rho=0.999; if(p->rho<-0.999) p->rho=-0.999;
-    if(p->lambda_j<0.001) p->lambda_j=0.001; if(p->lambda_j>3000.0) p->lambda_j=3000.0;
+    if(p->lambda_j<0.001) p->lambda_j=0.001; if(p->lambda_j>5000.0) p->lambda_j=5000.0;
     if(p->sigma_j<0.0001) p->sigma_j=0.0001;
+    // Feller soft limit (20x buffer)
     double feller = 2.0*p->kappa*p->theta;
     if(p->sigma_v*p->sigma_v > feller*20.0) p->sigma_v=sqrt(feller*20.0);
 }
@@ -53,6 +63,8 @@ void estimate_initial_params(double* ohlcv, int n, double dt, SVCJParams* p) {
     check_constraints(p);
 }
 
+// --- Optimization Core ---
+// Pure Likelihood (For Testing)
 double ukf_pure_likelihood(double* returns, int n, double dt, SVCJParams* p, double* out_spot_vol, double* out_jump_prob) {
     double ll=0; double v=p->theta; double var_j=p->mu_j*p->mu_j + p->sigma_j*p->sigma_j;
     for(int t=0; t<n; t++) {
@@ -60,9 +72,10 @@ double ukf_pure_likelihood(double* returns, int n, double dt, SVCJParams* p, dou
         if(v_pred<1e-9) v_pred=1e-9;
         double y = returns[t] - (p->mu - 0.5*v_pred)*dt;
         
+        // Phenotypic Mixing (Robustness)
         double rob_var = (v_pred<1e-9)?1e-9:v_pred; rob_var*=dt;
         double pdf_d = (1.0/sqrt(rob_var*2*M_PI))*exp(-0.5*y*y/rob_var);
-        double tot_j = rob_var+var_j; 
+        double tot_j = rob_var + var_j; 
         double yj = y - p->mu_j;
         double pdf_j = (1.0/sqrt(tot_j*2*M_PI))*exp(-0.5*yj*yj/tot_j);
         
@@ -82,7 +95,9 @@ double ukf_pure_likelihood(double* returns, int n, double dt, SVCJParams* p, dou
     return ll;
 }
 
+// Objective Function (Likelihood + Regularization)
 double obj_func(double* returns, int n, double dt, SVCJParams* p) {
+    // Only apply weak regularization to guide optimizer, not to bias test
     return ukf_pure_likelihood(returns, n, dt, p, NULL, NULL) - 0.05*(p->sigma_v*p->sigma_v);
 }
 
@@ -93,6 +108,7 @@ void optimize_svcj(double* ohlcv, int n, double dt, SVCJParams* p, double* out_s
     compute_log_returns(ohlcv, n, ret);
     
     int n_dim=5; double simplex[6][5]; double scores[6];
+    // Init Simplex
     for(int i=0; i<=n_dim; i++) {
         SVCJParams t = *p;
         if(i==1) t.kappa*=1.3; if(i==2) t.theta*=1.3; if(i==3) t.sigma_v*=1.3;
@@ -102,6 +118,7 @@ void optimize_svcj(double* ohlcv, int n, double dt, SVCJParams* p, double* out_s
         simplex[i][3]=t.rho;   simplex[i][4]=t.lambda_j;
         scores[i] = obj_func(ret, n-1, dt, &t);
     }
+    // Nelder-Mead
     for(int k=0; k<NM_ITER; k++) {
         int vs[6]; for(int j=0; j<6; j++) vs[j]=j;
         for(int i=0; i<6; i++) { for(int j=i+1; j<6; j++) { if(scores[vs[j]] > scores[vs[i]]) { int tmp=vs[i]; vs[i]=vs[j]; vs[j]=tmp; } } }
@@ -127,16 +144,31 @@ void optimize_svcj(double* ohlcv, int n, double dt, SVCJParams* p, double* out_s
     free(ret);
 }
 
-// --- Fidelity Engine with Physics Export ---
-void run_fidelity_scan(double* ohlcv, int total_len, double dt, FidelityMetrics* out) {
-    int win_impulse = 30; 
-    int win_gravity = win_impulse * 4;
+// --- VoV Spectrum Scan ---
+void run_vov_scan(double* ohlcv, int total_len, double dt, int step, VoVPoint* out_buffer, int max_steps) {
+    SVCJParams p;
+    int idx = 0;
+    // Scan windows from 30 up to N
+    for(int w = 30; w < total_len; w += step) {
+        if(idx >= max_steps) break;
+        int start = total_len - w;
+        optimize_svcj(ohlcv + start*N_COLS, w, dt, &p, NULL, NULL);
+        
+        out_buffer[idx].window = w;
+        out_buffer[idx].sigma_v = p.sigma_v; // The Stability Metric
+        out_buffer[idx].theta = p.theta;
+        idx++;
+    }
+    if(idx < max_steps) out_buffer[idx].window = 0; // Terminate
+}
+
+// --- Fidelity Engine ---
+void run_fidelity_check(double* ohlcv, int total_len, int win_grav, int win_imp, double dt, FidelityMetrics* out) {
+    SVCJParams p_grav, p_imp;
     
-    if (total_len < win_gravity) { out->is_valid=0; return; }
-    
-    SVCJParams p_grav;
-    int start_grav = total_len - win_gravity;
-    optimize_svcj(ohlcv + start_grav*N_COLS, win_gravity, dt, &p_grav, NULL, NULL);
+    // 1. Fit Gravity (Natural Frequency)
+    int start_grav = total_len - win_grav;
+    optimize_svcj(ohlcv + start_grav*N_COLS, win_grav, dt, &p_grav, NULL, NULL);
     
     // EXPORT PHYSICS
     out->fit_theta = p_grav.theta;
@@ -145,34 +177,60 @@ void run_fidelity_scan(double* ohlcv, int total_len, double dt, FidelityMetrics*
     out->fit_rho = p_grav.rho;
     out->fit_lambda = p_grav.lambda_j;
     
-    SVCJParams p_imp;
-    double* imp_spot = malloc((win_impulse-1)*sizeof(double));
-    int start_imp = total_len - win_impulse;
-    optimize_svcj(ohlcv + start_imp*N_COLS, win_impulse, dt, &p_imp, imp_spot, NULL);
+    // 2. Fit Impulse (Current State)
+    int start_imp = total_len - win_imp;
+    double* imp_spot = malloc((win_imp-1)*sizeof(double));
+    optimize_svcj(ohlcv + start_imp*N_COLS, win_imp, dt, &p_imp, imp_spot, NULL);
     
-    double kinetic = imp_spot[win_impulse-2];
+    double kinetic = imp_spot[win_imp-2];
     out->energy_ratio = (kinetic * kinetic) / p_grav.theta;
     
-    double* ret = malloc((win_impulse-1)*sizeof(double));
-    compute_log_returns(ohlcv + start_imp*N_COLS, win_impulse, ret);
+    // 3. Residue Calc (Ljung-Box & Bias)
+    double* ret = malloc((win_imp-1)*sizeof(double));
+    compute_log_returns(ohlcv + start_imp*N_COLS, win_imp, ret);
+    
     double res_sum=0, res_sq=0;
-    for(int i=0; i<win_impulse-1; i++) {
+    double mean_ret = 0;
+    
+    for(int i=0; i<win_imp-1; i++) {
         double r = ret[i] - (p_grav.mu*dt);
-        res_sum+=r; res_sq+=r*r;
+        res_sum += r;
+        res_sq += r*r;
+        ret[i] = r;
+        mean_ret += r;
     }
-    double res_var = (res_sq - (res_sum*res_sum)/(win_impulse-1))/(win_impulse-2);
-    double std_err = sqrt(res_var/(win_impulse-1));
+    mean_ret /= (win_imp-1);
+    
+    // Ljung-Box (Lag 1)
+    double num=0, den=0;
+    for(int i=0; i<win_imp-2; i++) {
+        num += (ret[i]-mean_ret)*(ret[i+1]-mean_ret);
+        den += (ret[i]-mean_ret)*(ret[i]-mean_ret);
+    }
+    double rho1 = (den>1e-9) ? num/den : 0;
+    int n = win_imp - 1;
+    double lb_stat = n*(n+2)*(rho1*rho1/(n-1));
+    out->lb_p_value = chi2_prob(lb_stat, 1);
     
     out->residue_bias = res_sum;
-    out->f_p_value = f_test_prob(out->energy_ratio, win_impulse-1, win_gravity-1);
-    double t_stat = (res_sum/(win_impulse-1)) / std_err;
-    out->t_p_value = t_test_prob(t_stat, win_impulse-2);
+    out->win_impulse = win_imp;
+    out->win_gravity = win_grav;
     
+    // Tests
+    double res_var = (res_sq - (res_sum*res_sum)/n)/(n-1);
+    double std_err = sqrt(res_var/n);
+    
+    out->f_p_value = f_test_prob(out->energy_ratio, win_imp-1, win_grav-1);
+    double t_stat = (res_sum/n) / std_err;
+    out->t_p_value = t_test_prob(t_stat, n-1);
+    
+    // Logic: Energy Real (F<0.05) AND Direction Real (T<0.10)
     out->is_valid = (out->f_p_value < 0.05 && out->t_p_value < 0.10) ? 1 : 0;
     
     free(imp_spot); free(ret);
 }
 
+// --- Instant Filter ---
 void run_instant_filter(double return_val, double dt, SVCJParams* p, double* state_var, InstantState* out) {
     double v_curr = *state_var;
     double v_pred = v_curr + p->kappa*(p->theta - v_curr)*dt;
@@ -197,4 +255,26 @@ void run_instant_filter(double return_val, double dt, SVCJParams* p, double* sta
     out->current_jump_prob = pr / (pr + pdf*(1-pr));
     
     *state_var = v_new;
+}
+
+// Pricing
+double norm_cdf_calc(double x) { return 0.5 * fast_erfc(-x * 0.70710678); }
+void calc_greeks(double s0, double K, double T, double r, SVCJParams* p, double spot_vol, int type, SVCJGreeks* out) {
+    double lambda = p->lambda_j; double lamp = lambda * (1.0 + p->mu_j);
+    out->delta = 0; out->gamma = 0; out->vega = 0;
+    for(int k=0; k<12; k++) {
+        double fact=1.0; for(int j=1;j<=k;j++) fact*=j;
+        double prob = exp(-lamp*T)*pow(lamp*T,k)/fact;
+        if(prob < 1e-9) continue;
+        double rk = r - lambda*p->mu_j + (k*log(1.0+p->mu_j))/T;
+        double vk = sqrt(spot_vol*spot_vol + (k*p->sigma_j*p->sigma_j)/T);
+        double d1 = (log(s0/K) + (rk+0.5*vk*vk)*T)/(vk*sqrt(T));
+        double d2 = d1 - vk*sqrt(T);
+        double delta = (type==1) ? norm_cdf_calc(d1) : norm_cdf_calc(d1)-1.0;
+        out->delta += prob*delta;
+        double nd1 = (1.0/SQRT_2PI)*exp(-0.5*d1*d1);
+        out->gamma += prob * (nd1 / (s0*vk*sqrt(T)));
+        double dv_ds = spot_vol / vk;
+        out->vega += prob * (s0 * nd1 * sqrt(T)) * dv_ds;
+    }
 }
