@@ -1,48 +1,212 @@
 #include "svcj.h"
 #include <float.h>
 
-// --- Statistical Functions ---
-double fast_erfc(double x) {
+// =========================================================
+// HIGH-PERFORMANCE SORTING ENGINE (No Function Pointers)
+// =========================================================
+
+// 1. Insertion Sort (Fastest for N < 16)
+static void _isort_dbl(double* arr, int n) {
+    for (int i = 1; i < n; i++) {
+        double key = arr[i];
+        int j = i - 1;
+        while (j >= 0 && arr[j] > key) {
+            arr[j + 1] = arr[j];
+            j = j - 1;
+        }
+        arr[j + 1] = key;
+    }
+}
+
+// 2. Median-of-3 QuickSort (Recursive)
+static void _qsort_dbl(double* arr, int low, int high) {
+    if (low >= high) return;
+    
+    // Fallback to Insertion Sort for small partitions (CPU Cache Optimization)
+    if (high - low < 16) {
+        _isort_dbl(arr + low, high - low + 1);
+        return;
+    }
+
+    double pivot = arr[high];
+    int i = (low - 1);
+
+    for (int j = low; j <= high - 1; j++) {
+        if (arr[j] <= pivot) {
+            i++;
+            double temp = arr[i]; arr[i] = arr[j]; arr[j] = temp;
+        }
+    }
+    double temp = arr[i + 1]; arr[i + 1] = arr[high]; arr[high] = temp;
+    int pi = i + 1;
+
+    _qsort_dbl(arr, low, pi - 1);
+    _qsort_dbl(arr, pi + 1, high);
+}
+
+// Public API
+void sort_doubles_fast(double* arr, int n) {
+    _qsort_dbl(arr, 0, n - 1);
+}
+
+// --- Specialized Rank Sort (For Mann-Whitney) ---
+static void _isort_rank(RankItem* arr, int n) {
+    for (int i = 1; i < n; i++) {
+        RankItem key = arr[i];
+        int j = i - 1;
+        while (j >= 0 && arr[j].val > key.val) {
+            arr[j + 1] = arr[j];
+            j--;
+        }
+        arr[j + 1] = key;
+    }
+}
+
+static void _qsort_rank(RankItem* arr, int low, int high) {
+    if (low >= high) return;
+    if (high - low < 16) {
+        _isort_rank(arr + low, high - low + 1);
+        return;
+    }
+    double pivot = arr[high].val;
+    int i = (low - 1);
+    for (int j = low; j <= high - 1; j++) {
+        if (arr[j].val <= pivot) {
+            i++;
+            RankItem temp = arr[i]; arr[i] = arr[j]; arr[j] = temp;
+        }
+    }
+    RankItem temp = arr[i + 1]; arr[i + 1] = arr[high]; arr[high] = temp;
+    int pi = i + 1;
+    _qsort_rank(arr, low, pi - 1);
+    _qsort_rank(arr, pi + 1, high);
+}
+
+void sort_ranks_fast(RankItem* arr, int n) {
+    _qsort_rank(arr, 0, n - 1);
+}
+
+// =========================================================
+// STATISTICAL TESTS (Using Fast Sort)
+// =========================================================
+
+double norm_cdf(double x) {
     double t = 1.0 / (1.0 + 0.5 * fabs(x));
     double tau = t * exp(-x*x - 1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))));
     return x >= 0 ? tau : 2.0 - tau;
 }
-double norm_cdf(double x) { return 0.5 * fast_erfc(-x * 0.70710678); }
 
-double f_test_prob(double f, int df1, int df2) {
-    if (f <= 0) return 1.0;
-    double a = 2.0/(9.0*df1); double b = 2.0/(9.0*df2);
-    double y = pow(f, 1.0/3.0);
-    double z = ((1.0-b)*y - (1.0-a))/sqrt(b*y*y + a);
+double calc_median(double* data, int n) {
+    double* sorted = malloc(n * sizeof(double));
+    memcpy(sorted, data, n * sizeof(double));
+    sort_doubles_fast(sorted, n); // FAST SORT
+    double med = (n % 2 == 0) ? (sorted[n/2 - 1] + sorted[n/2]) / 2.0 : sorted[n/2];
+    free(sorted);
+    return med;
+}
+
+double perform_levene_test(double* group1, int n1, double* group2, int n2) {
+    double med1 = calc_median(group1, n1);
+    double med2 = calc_median(group2, n2);
+    
+    double* z1 = malloc(n1 * sizeof(double));
+    double* z2 = malloc(n2 * sizeof(double));
+    double sum_z1=0, sum_z2=0;
+    
+    for(int i=0; i<n1; i++) { z1[i] = fabs(group1[i] - med1); sum_z1 += z1[i]; }
+    for(int i=0; i<n2; i++) { z2[i] = fabs(group2[i] - med2); sum_z2 += z2[i]; }
+    
+    double mean_z1 = sum_z1/n1;
+    double mean_z2 = sum_z2/n2;
+    double grand_mean = (sum_z1 + sum_z2) / (n1 + n2);
+    
+    double ssb = n1*(mean_z1-grand_mean)*(mean_z1-grand_mean) + n2*(mean_z2-grand_mean)*(mean_z2-grand_mean);
+    double ssw = 0;
+    for(int i=0; i<n1; i++) ssw += (z1[i]-mean_z1)*(z1[i]-mean_z1);
+    for(int i=0; i<n2; i++) ssw += (z2[i]-mean_z2)*(z2[i]-mean_z2);
+    
+    free(z1); free(z2);
+    if (ssw < 1e-9) return 1.0;
+    double f = ssb / (ssw / (n1 + n2 - 2));
+    return 2.0 * norm_cdf(-sqrt(f));
+}
+
+double perform_mann_whitney(double* group1, int n1, double* group2, int n2) {
+    int total_n = n1 + n2;
+    RankItem* items = malloc(total_n * sizeof(RankItem));
+    
+    for(int i=0; i<n1; i++) { items[i].val = group1[i]; items[i].group = 1; }
+    for(int i=0; i<n2; i++) { items[n1+i].val = group2[i]; items[n1+i].group = 2; }
+    
+    sort_ranks_fast(items, total_n); // FAST SORT
+    
+    for(int i=0; i<total_n; ) {
+        int j = i;
+        while(j < total_n && items[j].val == items[i].val) j++;
+        double rank = (i + 1 + j) / 2.0;
+        for(int k=i; k<j; k++) items[k].rank = rank;
+        i = j;
+    }
+    
+    double r1 = 0;
+    for(int i=0; i<total_n; i++) {
+        if(items[i].group == 1) r1 += items[i].rank;
+    }
+    free(items);
+    
+    double u1 = r1 - (n1*(n1+1))/2.0;
+    double u2 = (n1*n2) - u1;
+    double u = (u1 < u2) ? u1 : u2;
+    
+    double mu_u = (n1*n2)/2.0;
+    double sigma_u = sqrt((n1*n2*(n1+n2+1))/12.0);
+    double z = (u - mu_u) / sigma_u;
     return 2.0 * norm_cdf(-fabs(z));
 }
-double t_test_prob(double t, int df) { return 2.0 * norm_cdf(-fabs(t)); }
-double chi2_prob(double x, int k) {
-    if (x <= 0) return 1.0;
-    double s = 2.0/9.0/k;
-    double z = (pow(x/k, 1.0/3.0) - (1.0 - s)) / sqrt(s);
-    return 0.5 * erfc(z * 0.70710678);
+
+double perform_ks_test(double* group1, int n1, double* group2, int n2) {
+    double* s1 = malloc(n1 * sizeof(double)); memcpy(s1, group1, n1*sizeof(double));
+    double* s2 = malloc(n2 * sizeof(double)); memcpy(s2, group2, n2*sizeof(double));
+    
+    sort_doubles_fast(s1, n1); // FAST SORT
+    sort_doubles_fast(s2, n2); // FAST SORT
+    
+    double max_d = 0.0;
+    int i=0, j=0;
+    while(i < n1 && j < n2) {
+        double d1 = s1[i]; double d2 = s2[j];
+        double cdf1 = (double)(i) / n1;
+        double cdf2 = (double)(j) / n2;
+        double diff = fabs(cdf1 - cdf2);
+        if (diff > max_d) max_d = diff;
+        if (d1 <= d2) i++; else j++;
+    }
+    free(s1); free(s2);
+    
+    double ne = (double)(n1*n2)/(n1+n2);
+    double lambda = (sqrt(ne) + 0.12 + 0.11/sqrt(ne)) * max_d;
+    double p = 0.0;
+    for(int k=1; k<=5; k++) p += 2 * pow(-1, k-1) * exp(-2*k*k*lambda*lambda);
+    if (p < 0) p = 0; if (p > 1) p = 1;
+    return p;
 }
 
-// --- Utils ---
+// --- STANDARD SVCJ LOGIC ---
 void compute_log_returns(double* ohlcv, int n_rows, double* out_returns) {
     for(int i=1; i<n_rows; i++) {
-        double prev = ohlcv[(i-1)*N_COLS + 3];
-        double curr = ohlcv[i*N_COLS + 3];
+        double prev = ohlcv[(i-1)*N_COLS+3]; double curr = ohlcv[i*N_COLS+3];
         if(prev < 1e-9) prev = 1e-9;
         out_returns[i-1] = log(curr/prev);
     }
 }
 
 void check_constraints(SVCJParams* p) {
-    // Soft constraints for extreme assets
     if(p->kappa<0.01) p->kappa=0.01; if(p->kappa>100.0) p->kappa=100.0;
     if(p->theta<1e-6) p->theta=1e-6; if(p->theta>50.0) p->theta=50.0;
     if(p->sigma_v<0.01) p->sigma_v=0.01; if(p->sigma_v>50.0) p->sigma_v=50.0;
     if(p->rho>0.999) p->rho=0.999; if(p->rho<-0.999) p->rho=-0.999;
-    if(p->lambda_j<0.001) p->lambda_j=0.001; if(p->lambda_j>5000.0) p->lambda_j=5000.0;
+    if(p->lambda_j<0.001) p->lambda_j=0.001; if(p->lambda_j>3000.0) p->lambda_j=3000.0;
     if(p->sigma_j<0.0001) p->sigma_j=0.0001;
-    // Feller soft limit (20x buffer)
     double feller = 2.0*p->kappa*p->theta;
     if(p->sigma_v*p->sigma_v > feller*20.0) p->sigma_v=sqrt(feller*20.0);
 }
@@ -63,31 +227,24 @@ void estimate_initial_params(double* ohlcv, int n, double dt, SVCJParams* p) {
     check_constraints(p);
 }
 
-// --- Optimization Core ---
-// Pure Likelihood (For Testing)
 double ukf_pure_likelihood(double* returns, int n, double dt, SVCJParams* p, double* out_spot_vol, double* out_jump_prob) {
     double ll=0; double v=p->theta; double var_j=p->mu_j*p->mu_j + p->sigma_j*p->sigma_j;
     for(int t=0; t<n; t++) {
         double v_pred = v + p->kappa*(p->theta - v)*dt;
         if(v_pred<1e-9) v_pred=1e-9;
         double y = returns[t] - (p->mu - 0.5*v_pred)*dt;
-        
-        // Phenotypic Mixing (Robustness)
         double rob_var = (v_pred<1e-9)?1e-9:v_pred; rob_var*=dt;
         double pdf_d = (1.0/sqrt(rob_var*2*M_PI))*exp(-0.5*y*y/rob_var);
-        double tot_j = rob_var + var_j; 
+        double tot_j = rob_var+var_j; 
         double yj = y - p->mu_j;
         double pdf_j = (1.0/sqrt(tot_j*2*M_PI))*exp(-0.5*yj*yj/tot_j);
-        
         double prior = p->lambda_j*dt; if(prior>0.999) prior=0.999;
         double den = pdf_j*prior + pdf_d*(1.0-prior);
         if(den<1e-25) den=1e-25;
         double post = (pdf_j*prior)/den;
-        
         double S = v_pred*dt + post*var_j;
         v = v_pred + (p->rho*p->sigma_v*dt/S)*y;
         if(v<1e-9)v=1e-9; if(v>50.0)v=50.0;
-        
         if(out_spot_vol) out_spot_vol[t]=sqrt(v_pred);
         if(out_jump_prob) out_jump_prob[t]=post;
         ll+=log(den);
@@ -95,9 +252,7 @@ double ukf_pure_likelihood(double* returns, int n, double dt, SVCJParams* p, dou
     return ll;
 }
 
-// Objective Function (Likelihood + Regularization)
 double obj_func(double* returns, int n, double dt, SVCJParams* p) {
-    // Only apply weak regularization to guide optimizer, not to bias test
     return ukf_pure_likelihood(returns, n, dt, p, NULL, NULL) - 0.05*(p->sigma_v*p->sigma_v);
 }
 
@@ -108,7 +263,6 @@ void optimize_svcj(double* ohlcv, int n, double dt, SVCJParams* p, double* out_s
     compute_log_returns(ohlcv, n, ret);
     
     int n_dim=5; double simplex[6][5]; double scores[6];
-    // Init Simplex
     for(int i=0; i<=n_dim; i++) {
         SVCJParams t = *p;
         if(i==1) t.kappa*=1.3; if(i==2) t.theta*=1.3; if(i==3) t.sigma_v*=1.3;
@@ -118,7 +272,6 @@ void optimize_svcj(double* ohlcv, int n, double dt, SVCJParams* p, double* out_s
         simplex[i][3]=t.rho;   simplex[i][4]=t.lambda_j;
         scores[i] = obj_func(ret, n-1, dt, &t);
     }
-    // Nelder-Mead
     for(int k=0; k<NM_ITER; k++) {
         int vs[6]; for(int j=0; j<6; j++) vs[j]=j;
         for(int i=0; i<6; i++) { for(int j=i+1; j<6; j++) { if(scores[vs[j]] > scores[vs[i]]) { int tmp=vs[i]; vs[i]=vs[j]; vs[j]=tmp; } } }
@@ -144,137 +297,59 @@ void optimize_svcj(double* ohlcv, int n, double dt, SVCJParams* p, double* out_s
     free(ret);
 }
 
-// --- VoV Spectrum Scan ---
-void run_vov_scan(double* ohlcv, int total_len, double dt, int step, VoVPoint* out_buffer, int max_steps) {
-    SVCJParams p;
-    int idx = 0;
-    // Scan windows from 30 up to N
-    for(int w = 30; w < total_len; w += step) {
-        if(idx >= max_steps) break;
-        int start = total_len - w;
-        optimize_svcj(ohlcv + start*N_COLS, w, dt, &p, NULL, NULL);
-        
-        out_buffer[idx].window = w;
-        out_buffer[idx].sigma_v = p.sigma_v; // The Stability Metric
-        out_buffer[idx].theta = p.theta;
-        idx++;
-    }
-    if(idx < max_steps) out_buffer[idx].window = 0; // Terminate
-}
-
-// --- Fidelity Engine ---
-void run_fidelity_check(double* ohlcv, int total_len, int win_grav, int win_imp, double dt, FidelityMetrics* out) {
-    SVCJParams p_grav, p_imp;
+void run_nonparametric_scan(double* ohlcv, int total_len, double dt, FidelityMetrics* out) {
+    int win_imp = 30; int win_grav = win_imp * 4;
+    if (total_len < win_grav) { out->is_valid=0; return; }
     
-    // 1. Fit Gravity (Natural Frequency)
-    int start_grav = total_len - win_grav;
-    optimize_svcj(ohlcv + start_grav*N_COLS, win_grav, dt, &p_grav, NULL, NULL);
+    SVCJParams p_grav;
+    optimize_svcj(ohlcv + (total_len-win_grav)*N_COLS, win_grav, dt, &p_grav, NULL, NULL);
+    out->fit_theta = p_grav.theta; out->fit_kappa = p_grav.kappa;
+    out->fit_sigma_v = p_grav.sigma_v; out->fit_rho = p_grav.rho; out->fit_lambda = p_grav.lambda_j;
     
-    // EXPORT PHYSICS
-    out->fit_theta = p_grav.theta;
-    out->fit_kappa = p_grav.kappa;
-    out->fit_sigma_v = p_grav.sigma_v;
-    out->fit_rho = p_grav.rho;
-    out->fit_lambda = p_grav.lambda_j;
-    
-    // 2. Fit Impulse (Current State)
-    int start_imp = total_len - win_imp;
+    SVCJParams p_imp;
     double* imp_spot = malloc((win_imp-1)*sizeof(double));
-    optimize_svcj(ohlcv + start_imp*N_COLS, win_imp, dt, &p_imp, imp_spot, NULL);
+    optimize_svcj(ohlcv + (total_len-win_imp)*N_COLS, win_imp, dt, &p_imp, imp_spot, NULL);
+    out->energy_ratio = (imp_spot[win_imp-2]*imp_spot[win_imp-2]) / p_grav.theta;
     
-    double kinetic = imp_spot[win_imp-2];
-    out->energy_ratio = (kinetic * kinetic) / p_grav.theta;
+    double* ret_long = malloc((win_grav-1)*sizeof(double));
+    compute_log_returns(ohlcv + (total_len-win_grav)*N_COLS, win_grav, ret_long);
     
-    // 3. Residue Calc (Ljung-Box & Bias)
-    double* ret = malloc((win_imp-1)*sizeof(double));
-    compute_log_returns(ohlcv + start_imp*N_COLS, win_imp, ret);
+    double* ret_short = malloc((win_imp-1)*sizeof(double));
+    compute_log_returns(ohlcv + (total_len-win_imp)*N_COLS, win_imp, ret_short);
     
-    double res_sum=0, res_sq=0;
-    double mean_ret = 0;
+    // Robust Tests
+    out->levene_p = perform_levene_test(ret_short, win_imp-1, ret_long, win_grav-1);
+    out->mw_p = perform_mann_whitney(ret_short, win_imp-1, ret_long, win_grav-1);
+    out->ks_p = perform_ks_test(ret_short, win_imp-1, ret_long, win_grav-1);
+    out->residue_median = calc_median(ret_short, win_imp-1);
     
-    for(int i=0; i<win_imp-1; i++) {
-        double r = ret[i] - (p_grav.mu*dt);
-        res_sum += r;
-        res_sq += r*r;
-        ret[i] = r;
-        mean_ret += r;
-    }
-    mean_ret /= (win_imp-1);
-    
-    // Ljung-Box (Lag 1)
-    double num=0, den=0;
-    for(int i=0; i<win_imp-2; i++) {
-        num += (ret[i]-mean_ret)*(ret[i+1]-mean_ret);
-        den += (ret[i]-mean_ret)*(ret[i]-mean_ret);
-    }
-    double rho1 = (den>1e-9) ? num/den : 0;
-    int n = win_imp - 1;
-    double lb_stat = n*(n+2)*(rho1*rho1/(n-1));
-    out->lb_p_value = chi2_prob(lb_stat, 1);
-    
-    out->residue_bias = res_sum;
     out->win_impulse = win_imp;
     out->win_gravity = win_grav;
     
-    // Tests
-    double res_var = (res_sq - (res_sum*res_sum)/n)/(n-1);
-    double std_err = sqrt(res_var/n);
+    // VALIDITY: Energy(Levene) OR Shape(KS) changed, AND Direction(MW) is significant
+    int struct_break = (out->levene_p < 0.05 || out->ks_p < 0.05);
+    int dir_break = (out->mw_p < 0.10);
+    out->is_valid = (struct_break && dir_break) ? 1 : 0;
     
-    out->f_p_value = f_test_prob(out->energy_ratio, win_imp-1, win_grav-1);
-    double t_stat = (res_sum/n) / std_err;
-    out->t_p_value = t_test_prob(t_stat, n-1);
-    
-    // Logic: Energy Real (F<0.05) AND Direction Real (T<0.10)
-    out->is_valid = (out->f_p_value < 0.05 && out->t_p_value < 0.10) ? 1 : 0;
-    
-    free(imp_spot); free(ret);
+    free(imp_spot); free(ret_long); free(ret_short);
 }
 
-// --- Instant Filter ---
 void run_instant_filter(double return_val, double dt, SVCJParams* p, double* state_var, InstantState* out) {
     double v_curr = *state_var;
     double v_pred = v_curr + p->kappa*(p->theta - v_curr)*dt;
     if(v_pred<1e-9) v_pred=1e-9;
-    
     double y = return_val - (p->mu - 0.5*v_pred)*dt;
-    
     double jump_var = p->lambda_j*(p->mu_j*p->mu_j + p->sigma_j*p->sigma_j);
     double total_std = sqrt((v_pred + jump_var)*dt);
     if(total_std<1e-9) total_std=1e-9;
-    
     out->innovation_z_score = y / total_std;
-    
     double S = v_pred*dt + (p->lambda_j*dt*jump_var);
     double K = (p->rho*p->sigma_v*dt)/S;
     double v_new = v_pred + K*y;
     if(v_new<1e-9) v_new=1e-9;
-    
     out->current_spot_vol = sqrt(v_new);
     double pdf = (1.0/sqrt(2*M_PI*v_pred*dt))*exp(-0.5*y*y/(v_pred*dt));
     double pr = p->lambda_j*dt;
     out->current_jump_prob = pr / (pr + pdf*(1-pr));
-    
     *state_var = v_new;
-}
-
-// Pricing
-double norm_cdf_calc(double x) { return 0.5 * fast_erfc(-x * 0.70710678); }
-void calc_greeks(double s0, double K, double T, double r, SVCJParams* p, double spot_vol, int type, SVCJGreeks* out) {
-    double lambda = p->lambda_j; double lamp = lambda * (1.0 + p->mu_j);
-    out->delta = 0; out->gamma = 0; out->vega = 0;
-    for(int k=0; k<12; k++) {
-        double fact=1.0; for(int j=1;j<=k;j++) fact*=j;
-        double prob = exp(-lamp*T)*pow(lamp*T,k)/fact;
-        if(prob < 1e-9) continue;
-        double rk = r - lambda*p->mu_j + (k*log(1.0+p->mu_j))/T;
-        double vk = sqrt(spot_vol*spot_vol + (k*p->sigma_j*p->sigma_j)/T);
-        double d1 = (log(s0/K) + (rk+0.5*vk*vk)*T)/(vk*sqrt(T));
-        double d2 = d1 - vk*sqrt(T);
-        double delta = (type==1) ? norm_cdf_calc(d1) : norm_cdf_calc(d1)-1.0;
-        out->delta += prob*delta;
-        double nd1 = (1.0/SQRT_2PI)*exp(-0.5*d1*d1);
-        out->gamma += prob * (nd1 / (s0*vk*sqrt(T)));
-        double dv_ds = spot_vol / vk;
-        out->vega += prob * (s0 * nd1 * sqrt(T)) * dv_ds;
-    }
 }
