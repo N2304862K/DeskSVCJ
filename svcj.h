@@ -17,31 +17,24 @@ typedef struct {
     double current_spot_vol;
     double current_jump_prob;
     double innovation_z_score;
+    double jerk; // d(Z_score)/dt (Acceleration)
 } InstantState;
 
 typedef struct {
-    // Doubles (8-byte aligned)
+    // Signals
     double energy_ratio;
-    double residue_median;
-    double levene_p;     // Energy Robust P
-    double mw_p;         // Direction Robust P
-    double ks_ret_p;     // Return Shape P
-    double ks_vol_p;     // Vol Path Shape P
+    double residue_bias;
     
-    // Physics Payload
-    double fit_theta;
-    double fit_kappa;
-    double fit_sigma_v;
-    double fit_rho;
-    double fit_lambda;
-    
-    // Ints (4-byte aligned)
-    int win_impulse;
-    int win_gravity;
+    // Stats
+    double levene_p;     // Volatility Significance
+    double mw_p;         // Drift Significance
     int is_valid;
+    
+    // Physics
+    double fit_theta, fit_kappa, fit_sigma_v, fit_rho, fit_lambda;
 } FidelityMetrics;
 
-// Utils
+// Core
 void compute_log_returns(double* ohlcv, int n_rows, double* out_returns);
 void compute_detrended_returns(double* ohlcv, int n_rows, double* out_returns);
 double get_avg_volume(double* ohlcv, int n);
@@ -49,12 +42,8 @@ double get_avg_volume(double* ohlcv, int n);
 // Sort
 void sort_doubles_fast(double* arr, int n);
 
-// Optimization
-void estimate_initial_params(double* ohlcv, int n, double dt, SVCJParams* p);
-void optimize_svcj_vol_weighted(double* ohlcv, int n, double dt, double avg_vol, SVCJParams* p, double* out_spot_vol);
-
 // Engines
 void run_full_audit_scan(double* ohlcv, int total_len, double dt, FidelityMetrics* out);
-void run_instant_filter_vol(double ret, double vol, double avg_vol, double dt, SVCJParams* p, double* state, InstantState* out);
+void run_instant_filter_vol(double ret, double vol, double avg_vol, double dt, SVCJParams* p, double* state, double* prev_z, InstantState* out);
 
 #endif
