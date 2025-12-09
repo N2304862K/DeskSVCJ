@@ -1,7 +1,10 @@
 from setuptools import setup, Extension
 from Cython.Build import cythonize
-import numpy
 import sys
+import os
+
+# --- THIS SECTION REQUIRES NUMPY TO BE PRE-INSTALLED ---
+import numpy
 
 # Platform specific OpenMP flags
 if sys.platform.startswith("win"):
@@ -18,7 +21,6 @@ extensions = [
         include_dirs=[numpy.get_include(), "."],
         extra_compile_args=compile_args,
         extra_link_args=link_args,
-        define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")]
     )
 ]
 
