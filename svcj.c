@@ -1,111 +1,133 @@
 #include "svcj.h"
 #include <float.h>
 
-// --- SORTING ---
-static void _qsort_dbl(double* arr, int low, int high) {
-    if (low >= high) return;
-    double pivot = arr[high];
-    int i = (low - 1);
-    for (int j = low; j <= high - 1; j++) {
-        if (arr[j] <= pivot) {
-            i++; double t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+// --- SORTING (Shell Sort - Robust & No Recursion) ---
+void sort_doubles(double* arr, int n) {
+    for (int gap = n/2; gap > 0; gap /= 2) {
+        for (int i = gap; i < n; i++) {
+            double temp = arr[i];
+            int j;
+            for (j = i; j >= gap && arr[j - gap] > temp; j -= gap)
+                arr[j] = arr[j - gap];
+            arr[j] = temp;
         }
     }
-    double t = arr[i + 1]; arr[i + 1] = arr[high]; arr[high] = t;
-    _qsort_dbl(arr, low, i);
-    _qsort_dbl(arr, i + 2, high);
 }
-void sort_doubles_fast(double* arr, int n) { _qsort_dbl(arr, 0, n - 1); }
 
+// Rank Item for MW Test
 typedef struct { double val; int group; double rank; } RankItem;
-static void _qsort_rank(RankItem* arr, int low, int high) {
-    if (low >= high) return;
-    double pivot = arr[high].val;
-    int i = (low - 1);
-    for (int j = low; j <= high - 1; j++) {
-        if (arr[j].val <= pivot) {
-            i++; RankItem t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+void sort_ranks(RankItem* arr, int n) {
+    for (int gap = n/2; gap > 0; gap /= 2) {
+        for (int i = gap; i < n; i++) {
+            RankItem temp = arr[i];
+            int j;
+            // Compare by value
+            for (j = i; j >= gap && arr[j - gap].val > temp.val; j -= gap)
+                arr[j] = arr[j - gap];
+            arr[j] = temp;
         }
     }
-    RankItem t = arr[i + 1]; arr[i + 1] = arr[high]; arr[high] = t;
-    _qsort_rank(arr, low, i);
-    _qsort_rank(arr, i + 2, high);
 }
 
-// --- STATS ---
-double norm_cdf(double x) {
+// --- STATISTICAL TESTS ---
+double fast_erfc(double x) {
     double t = 1.0 / (1.0 + 0.5 * fabs(x));
     double tau = t * exp(-x*x - 1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))));
     return x >= 0 ? tau : 2.0 - tau;
 }
+double norm_cdf(double x) { return 0.5 * fast_erfc(-x * 0.70710678); }
 
 double calc_median(double* data, int n) {
-    double* s = malloc(n*sizeof(double)); memcpy(s, data, n*sizeof(double));
-    sort_doubles_fast(s, n);
+    double* s = malloc(n*sizeof(double));
+    memcpy(s, data, n*sizeof(double));
+    sort_doubles(s, n);
     double med = (n%2==0) ? (s[n/2-1]+s[n/2])/2.0 : s[n/2];
     free(s); return med;
 }
 
+// Levene's Test (Robust Variance Equality)
 double perform_levene(double* g1, int n1, double* g2, int n2) {
-    // Tests Variance Equality (Needs Detrended Data)
-    double m1 = calc_median(g1, n1); double m2 = calc_median(g2, n2);
-    double* z1 = malloc(n1*sizeof(double)); double* z2 = malloc(n2*sizeof(double));
+    double m1 = calc_median(g1, n1);
+    double m2 = calc_median(g2, n2);
+    
+    double* z1 = malloc(n1*sizeof(double));
+    double* z2 = malloc(n2*sizeof(double));
     double sm1=0, sm2=0;
+    
     for(int i=0; i<n1; i++) { z1[i]=fabs(g1[i]-m1); sm1+=z1[i]; }
     for(int i=0; i<n2; i++) { z2[i]=fabs(g2[i]-m2); sm2+=z2[i]; }
+    
     double gm = (sm1+sm2)/(n1+n2);
     double ssw=0, ssb = n1*pow(sm1/n1-gm,2) + n2*pow(sm2/n2-gm,2);
+    
     for(int i=0; i<n1; i++) ssw+=pow(z1[i]-sm1/n1,2);
     for(int i=0; i<n2; i++) ssw+=pow(z2[i]-sm2/n2,2);
+    
     free(z1); free(z2);
     if(ssw<1e-9) return 1.0;
+    
     double f = ssb / (ssw/(n1+n2-2));
-    double p = 2.0 * norm_cdf(-sqrt(f));
-    return (p>1.0)?1.0:p;
+    return 2.0 * norm_cdf(-sqrt(f));
 }
 
+// Mann-Whitney U (Robust Location Shift)
 double perform_mann_whitney(double* g1, int n1, double* g2, int n2) {
-    // Tests Location Shift (Needs RAW Data, NOT Detrended)
     int tn = n1+n2;
     RankItem* items = malloc(tn*sizeof(RankItem));
     for(int i=0; i<n1; i++) { items[i].val=g1[i]; items[i].group=1; }
     for(int i=0; i<n2; i++) { items[n1+i].val=g2[i]; items[n1+i].group=2; }
-    _qsort_rank(items, 0, tn-1);
+    
+    sort_ranks(items, tn);
+    
     double r1=0;
     for(int i=0; i<tn; ) {
-        int j=i; while(j<tn && items[j].val==items[i].val) j++;
+        int j=i; 
+        while(j<tn && items[j].val==items[i].val) j++;
         double r = (i+1+j)/2.0;
         for(int k=i; k<j; k++) if(items[k].group==1) r1+=r;
         i=j;
     }
     free(items);
+    
     double u = r1 - (n1*(n1+1))/2.0;
-    double mu = (n1*n2)/2.0; double sig = sqrt(n1*n2*(tn+1)/12.0);
-    double p = 2.0*norm_cdf(-fabs((u-mu)/sig));
-    return (p>1.0)?1.0:p;
+    double mu = (n1*n2)/2.0;
+    double sig = sqrt(n1*n2*(tn+1)/12.0);
+    return 2.0*norm_cdf(-fabs((u-mu)/sig));
 }
 
-// --- CORE ---
+// --- DATA PREP ---
 void compute_log_returns(double* ohlcv, int n_rows, double* out) {
     for(int i=1; i<n_rows; i++) {
         double p0 = ohlcv[(i-1)*N_COLS+3]; double p1 = ohlcv[i*N_COLS+3];
         out[i-1] = log(p1/p0);
     }
 }
-void compute_detrended_returns(double* ohlcv, int n_rows, double* out) {
-    compute_log_returns(ohlcv, n_rows, out);
-    double sum=0; for(int i=0; i<n_rows-1; i++) sum+=out[i];
-    double mean = sum/(n_rows-1);
-    for(int i=0; i<n_rows-1; i++) out[i] -= mean;
-}
-double get_avg_volume(double* ohlcv, int n) {
-    double sum=0; for(int i=0; i<n; i++) sum+=ohlcv[i*N_COLS+4];
-    return sum/n;
+
+// Volume-Weighted Returns for Levene Test
+void compute_vol_weighted_returns(double* ohlcv, int n_rows, double avg_vol, double* out) {
+    for(int i=1; i<n_rows; i++) {
+        double p0 = ohlcv[(i-1)*N_COLS+3]; 
+        double p1 = ohlcv[i*N_COLS+3];
+        double vol = ohlcv[i*N_COLS+4];
+        double r = log(p1/p0);
+        
+        // Scale return by sqrt of volume intensity
+        // Logic: High volume makes the 'effective' move larger in variance space
+        double v_scale = (avg_vol > 0) ? sqrt(vol/avg_vol) : 1.0;
+        out[i-1] = r * v_scale;
+    }
 }
 
+double get_avg_volume(double* ohlcv, int n) {
+    double s=0; for(int i=0; i<n; i++) s+=ohlcv[i*N_COLS+4];
+    return s/n;
+}
+
+// --- SVCJ OPTIMIZATION ---
 void check_constraints(SVCJParams* p) {
     if(p->kappa<0.1) p->kappa=0.1; if(p->kappa>50) p->kappa=50;
     if(p->theta<1e-6) p->theta=1e-6; if(p->sigma_v<0.01) p->sigma_v=0.01;
+    if(p->rho>0.99) p->rho=0.99; if(p->rho<-0.99) p->rho=-0.99;
 }
 
 void estimate_initial_params(double* ohlcv, int n, double dt, SVCJParams* p) {
@@ -132,11 +154,12 @@ double ukf_vol_weighted(double* returns, double* vols, int n, double dt, double 
         double v_pred = v + p->kappa*(p->theta - v)*dt_eff;
         if(v_pred<1e-9) v_pred=1e-9;
         
-        double y = returns[t];
+        double y = returns[t]; // Log return
         double rob_var = v_pred*dt_eff;
         if(rob_var<1e-12) rob_var=1e-12;
         
         double pdf_d = (1.0/sqrt(rob_var*2*M_PI))*exp(-0.5*y*y/rob_var);
+        
         double tot_j = rob_var + var_j;
         double yj = y - p->mu_j;
         double pdf_j = (1.0/sqrt(tot_j*2*M_PI))*exp(-0.5*yj*yj/tot_j);
@@ -164,7 +187,7 @@ void optimize_svcj_vol_weighted(double* ohlcv, int n, double dt, double avg_vol,
     estimate_initial_params(ohlcv, n, dt, p);
     double* ret = malloc((n-1)*sizeof(double));
     double* vols = malloc((n-1)*sizeof(double));
-    compute_detrended_returns(ohlcv, n, ret);
+    compute_log_returns(ohlcv, n, ret);
     for(int i=1; i<n; i++) vols[i-1] = ohlcv[i*N_COLS+4];
     
     int n_dim=5; double simplex[6][5]; double scores[6];
@@ -177,7 +200,7 @@ void optimize_svcj_vol_weighted(double* ohlcv, int n, double dt, double avg_vol,
         simplex[i][3]=t.rho;   simplex[i][4]=t.lambda_j;
         scores[i] = obj_func_vol(ret, vols, n-1, dt, avg_vol, &t);
     }
-    for(int k=0; k<100; k++) { 
+    for(int k=0; k<150; k++) { 
         int vs[6]; for(int j=0; j<6; j++) vs[j]=j;
         for(int i=0; i<6; i++) { for(int j=i+1; j<6; j++) { if(scores[vs[j]] > scores[vs[i]]) { int tmp=vs[i]; vs[i]=vs[j]; vs[j]=tmp; } } }
         double c[5]={0}; for(int i=0; i<5; i++) { for(int d=0; d<5; d++) c[d]+=simplex[vs[i]][d]; } for(int d=0; d<5; d++) c[d]/=5.0;
@@ -199,71 +222,69 @@ void optimize_svcj_vol_weighted(double* ohlcv, int n, double dt, double avg_vol,
     free(ret); free(vols);
 }
 
-// --- SCANNER ---
+// --- FULL AUDIT SCAN ---
 void run_full_audit_scan(double* ohlcv, int total_len, double dt, FidelityMetrics* out) {
     double avg_vol = get_avg_volume(ohlcv, total_len);
-    int win_imp = 30; 
-    int win_grav = 120;
+    int win_imp = 30; int win_grav = 120;
     
-    if (total_len < win_imp + win_grav) { out->is_valid=0; return; }
+    if(total_len < win_imp+win_grav) { out->is_valid=0; return; }
     
-    // Fit Gravity
+    // 1. Fit Gravity
     SVCJParams p_grav;
     int grav_start = total_len - win_imp - win_grav;
-    double* spot_grav = malloc((win_grav-1)*sizeof(double));
-    optimize_svcj_vol_weighted(ohlcv + grav_start*N_COLS, win_grav, dt, avg_vol, &p_grav, spot_grav);
-    
+    optimize_svcj_vol_weighted(ohlcv + grav_start*N_COLS, win_grav, dt, avg_vol, &p_grav, NULL);
     out->fit_theta = p_grav.theta; out->fit_kappa = p_grav.kappa;
     out->fit_sigma_v = p_grav.sigma_v; out->fit_rho = p_grav.rho; out->fit_lambda = p_grav.lambda_j;
     
-    // Fit Impulse
+    // 2. Fit Impulse
     SVCJParams p_imp;
     int imp_start = total_len - win_imp;
     double* spot_imp = malloc((win_imp-1)*sizeof(double));
     optimize_svcj_vol_weighted(ohlcv + imp_start*N_COLS, win_imp, dt, avg_vol, &p_imp, spot_imp);
-    
     double kinetic = spot_imp[win_imp-2];
     out->energy_ratio = (kinetic*kinetic) / p_grav.theta;
     
-    // STATS PREP: SEPARATE DATA STREAMS
-    // 1. Raw Returns (For Drift/Mann-Whitney)
-    double* raw_ret_grav = malloc((win_grav-1)*sizeof(double));
-    compute_log_returns(ohlcv + grav_start*N_COLS, win_grav, raw_ret_grav);
-    double* raw_ret_imp = malloc((win_imp-1)*sizeof(double));
-    compute_log_returns(ohlcv + imp_start*N_COLS, win_imp, raw_ret_imp);
+    // 3. Prepare Data for Non-Parametrics
+    // Levene (Energy): Use Volume-Weighted Returns
+    // Mann-Whitney (Direction): Use RAW Returns (Fix for P=1.0 bug)
     
-    // 2. Detrended Returns (For Variance/Levene)
-    double* det_ret_grav = malloc((win_grav-1)*sizeof(double));
-    compute_detrended_returns(ohlcv + grav_start*N_COLS, win_grav, det_ret_grav);
-    double* det_ret_imp = malloc((win_imp-1)*sizeof(double));
-    compute_detrended_returns(ohlcv + imp_start*N_COLS, win_imp, det_ret_imp);
+    double* ret_grav_raw = malloc((win_grav-1)*sizeof(double));
+    compute_log_returns(ohlcv + grav_start*N_COLS, win_grav, ret_grav_raw);
     
-    // TESTS
-    out->levene_p = perform_levene(det_ret_imp, win_imp-1, det_ret_grav, win_grav-1); // Use Detrended
-    out->mw_p = perform_mann_whitney(raw_ret_imp, win_imp-1, raw_ret_grav, win_grav-1); // Use Raw
+    double* ret_grav_vol = malloc((win_grav-1)*sizeof(double));
+    compute_vol_weighted_returns(ohlcv + grav_start*N_COLS, win_grav, avg_vol, ret_grav_vol);
     
-    // Shapes
-    out->ks_ret_p = perform_ks_test(det_ret_imp, win_imp-1, det_ret_grav, win_grav-1);
-    out->ks_vol_p = perform_ks_test(spot_imp, win_imp-1, spot_grav, win_grav-1);
+    double* ret_imp_raw = malloc((win_imp-1)*sizeof(double));
+    compute_log_returns(ohlcv + imp_start*N_COLS, win_imp, ret_imp_raw);
     
-    out->residue_median = calc_median(raw_ret_imp, win_imp-1); // Direction
+    double* ret_imp_vol = malloc((win_imp-1)*sizeof(double));
+    compute_vol_weighted_returns(ohlcv + imp_start*N_COLS, win_imp, avg_vol, ret_imp_vol);
     
-    // VALIDATION: Levene (Vol) OR KS_Vol (Structure) < 0.05 AND MW (Drift) < 0.10
-    int struct_break = (out->levene_p < 0.05 || out->ks_vol_p < 0.05);
+    // 4. Run Tests
+    // Levene on VOL-WEIGHTED (Did volume-adjusted energy expand?)
+    out->levene_p = perform_levene(ret_imp_vol, win_imp-1, ret_grav_vol, win_grav-1);
+    
+    // Mann-Whitney on RAW (Did price actually move?)
+    out->mw_p = perform_mann_whitney(ret_imp_raw, win_imp-1, ret_grav_raw, win_grav-1);
+    
+    // Calc median drift
+    out->residue_median = calc_median(ret_imp_raw, win_imp-1);
+    
+    // 5. Decision
+    // Valid if Energy Expanded (Levene < 0.05) OR Direction Shifted (MW < 0.10)
+    int energy_break = (out->levene_p < 0.05);
     int dir_break = (out->mw_p < 0.10);
-    out->is_valid = (struct_break && dir_break) ? 1 : 0;
     
-    out->win_impulse = win_imp; out->win_gravity = win_grav;
+    // We require EITHER strong energy OR strong direction, but preferably energy.
+    // For 'Breakout', we need Energy.
+    out->is_valid = (energy_break) ? 1 : 0;
     
-    free(spot_grav); free(spot_imp); 
-    free(raw_ret_grav); free(raw_ret_imp);
-    free(det_ret_grav); free(det_ret_imp);
+    free(spot_imp); free(ret_grav_raw); free(ret_grav_vol); free(ret_imp_raw); free(ret_imp_vol);
 }
 
-void run_instant_filter_vol(double ret, double vol, double avg_vol, double dt, SVCJParams* p, double* state, double* prev_z, InstantState* out) {
+void run_instant_filter_vol(double ret, double vol, double avg_vol, double dt, SVCJParams* p, double* state, InstantState* out) {
     double vol_scale = (avg_vol > 0) ? vol/avg_vol : 1.0;
     double dt_eff = dt * vol_scale;
-    
     double v_curr = *state;
     double v_pred = v_curr + p->kappa*(p->theta - v_curr)*dt_eff;
     if(v_pred<1e-9) v_pred=1e-9;
@@ -272,18 +293,7 @@ void run_instant_filter_vol(double ret, double vol, double avg_vol, double dt, S
     double jump_var = p->lambda_j*(p->mu_j*p->mu_j + p->sigma_j*p->sigma_j);
     double std = sqrt((v_pred + jump_var)*dt_eff);
     if(std<1e-9) std=1e-9;
-    
-    double current_z = y / std;
-    out->innovation_z_score = current_z;
-    
-    // JERK (dZ/dt) Calculation
-    // We pass prev_z pointer to maintain state
-    double jerk = (prev_z) ? (current_z - *prev_z) : 0.0;
-    if (prev_z) *prev_z = current_z; // Update State
-    
-    // Note: Can't easily export jerk in InstantState struct without changing header everywhere,
-    // but the key logic is that Z itself is the signal.
-    // If you need jerk in python, calc diff there. 
+    out->innovation_z_score = y / std;
     
     double S = v_pred*dt_eff + (p->lambda_j*dt_eff*jump_var);
     double K = (p->rho*p->sigma_v*dt_eff)/S;
@@ -294,6 +304,5 @@ void run_instant_filter_vol(double ret, double vol, double avg_vol, double dt, S
     double pdf = (1.0/sqrt(2*M_PI*v_pred*dt_eff))*exp(-0.5*y*y/(v_pred*dt_eff));
     double pr = p->lambda_j*dt_eff;
     out->current_jump_prob = pr / (pr + pdf*(1-pr));
-    
     *state = v_new;
 }

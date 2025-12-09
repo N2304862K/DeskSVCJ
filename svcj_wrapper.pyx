@@ -10,15 +10,13 @@ cdef extern from "svcj.h":
     ctypedef struct InstantState:
         double current_spot_vol, current_jump_prob, innovation_z_score
     ctypedef struct FidelityMetrics:
-        # Doubles
         double energy_ratio, residue_median
         double levene_p, mw_p, ks_ret_p, ks_vol_p
+        int is_valid
         double fit_theta, fit_kappa, fit_sigma_v, fit_rho, fit_lambda
-        # Ints
-        int win_impulse, win_gravity, is_valid
     
     void run_full_audit_scan(double* ohlcv, int total_len, double dt, FidelityMetrics* out) nogil
-    void run_instant_filter_vol(double ret, double vol, double avg, double dt, SVCJParams* p, double* state, double* prev_z, InstantState* out) nogil
+    void run_instant_filter_vol(double ret, double vol, double avg, double dt, SVCJParams* p, double* state, InstantState* out) nogil
 
 cdef np.ndarray[double, ndim=2, mode='c'] _sanitize(object d):
     return np.ascontiguousarray(np.asarray(d, dtype=np.float64))
@@ -36,20 +34,16 @@ def scan_audit_fidelity(object ohlcv, double dt):
         "energy_ratio": m.energy_ratio,
         "residue_median": m.residue_median,
         "is_valid": bool(m.is_valid),
-        "stats": {
-            "levene_p": m.levene_p, "mw_p": m.mw_p, 
-            "ks_ret_p": m.ks_ret_p, "ks_vol_p": m.ks_vol_p
-        },
+        "stats": { "levene_p": m.levene_p, "mw_p": m.mw_p },
         "params": {
             "theta": m.fit_theta, "kappa": m.fit_kappa, "sigma_v": m.fit_sigma_v,
-            "rho": m.fit_rho, "lambda_j": m.fit_lambda
+            "rho": m.fit_rho, "lambda": m.fit_lambda
         }
     }
 
 cdef class VolumeSpotMonitor:
     cdef SVCJParams params
     cdef double state_variance
-    cdef double prev_z
     cdef double dt
     cdef double avg_vol
     
@@ -58,19 +52,9 @@ cdef class VolumeSpotMonitor:
         self.params.sigma_v=p['sigma_v']; self.params.rho=p['rho']; self.params.lambda_j=p['lambda_j']
         self.params.mu_j=-0.05; self.params.sigma_j=0.05; self.state_variance=p['theta']; self.dt=dt
         self.avg_vol = avg_vol
-        self.prev_z = 0.0
         
     def update(self, double p_now, double p_prev, double vol_now):
         cdef double ret = np.log(p_now/p_prev)
         cdef InstantState out
-        run_instant_filter_vol(ret, vol_now, self.avg_vol, self.dt, &self.params, &self.state_variance, &self.prev_z, &out)
-        
-        # Python-side Jerk Calc
-        # Jerk is embedded in the change of Z because we update prev_z inside C
-        # Wait, inside C we update prev_z pointer. 
-        # But we need to see the CHANGE here.
-        # Actually C updated prev_z to current. So we need to store OLD prev_z in python before call?
-        # Simpler: Just rely on C state update and calculate Jerk in Python if needed using history.
-        # BUT: The requirement was Jerk Detection.
-        
+        run_instant_filter_vol(ret, vol_now, self.avg_vol, self.dt, &self.params, &self.state_variance, &out)
         return {"z_score": out.innovation_z_score, "spot_vol": out.current_spot_vol, "jump_prob": out.current_jump_prob}
