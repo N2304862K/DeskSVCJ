@@ -1,61 +1,41 @@
 #include "svcj.h"
 #include <float.h>
 
-// =========================================================
-// 1. HIGH-PERFORMANCE SORTING (Introsort Implementation)
-// =========================================================
-static void _isort_dbl(double* arr, int n) {
-    for (int i = 1; i < n; i++) {
-        double key = arr[i];
-        int j = i - 1;
-        while (j >= 0 && arr[j] > key) { arr[j + 1] = arr[j]; j--; }
-        arr[j + 1] = key;
-    }
-}
+// --- SORTING ---
 static void _qsort_dbl(double* arr, int low, int high) {
-    if (high - low < 16) { _isort_dbl(arr + low, high - low + 1); return; }
+    if (low >= high) return;
     double pivot = arr[high];
     int i = (low - 1);
     for (int j = low; j <= high - 1; j++) {
         if (arr[j] <= pivot) {
-            i++; double t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+            i++;
+            double t = arr[i]; arr[i] = arr[j]; arr[j] = t;
         }
     }
     double t = arr[i + 1]; arr[i + 1] = arr[high]; arr[high] = t;
-    int pi = i + 1;
-    _qsort_dbl(arr, low, pi - 1);
-    _qsort_dbl(arr, pi + 1, high);
+    _qsort_dbl(arr, low, i);
+    _qsort_dbl(arr, i + 2, high);
 }
 void sort_doubles_fast(double* arr, int n) { _qsort_dbl(arr, 0, n - 1); }
 
-// Rank Sort Struct
+// Rank Helper
 typedef struct { double val; int group; double rank; } RankItem;
-static void _isort_rank(RankItem* arr, int n) {
-    for (int i = 1; i < n; i++) {
-        RankItem key = arr[i];
-        int j = i - 1;
-        while (j >= 0 && arr[j].val > key.val) { arr[j + 1] = arr[j]; j--; }
-        arr[j + 1] = key;
-    }
-}
 static void _qsort_rank(RankItem* arr, int low, int high) {
-    if (high - low < 16) { _isort_rank(arr + low, high - low + 1); return; }
+    if (low >= high) return;
     double pivot = arr[high].val;
     int i = (low - 1);
     for (int j = low; j <= high - 1; j++) {
         if (arr[j].val <= pivot) {
-            i++; RankItem t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+            i++;
+            RankItem t = arr[i]; arr[i] = arr[j]; arr[j] = t;
         }
     }
     RankItem t = arr[i + 1]; arr[i + 1] = arr[high]; arr[high] = t;
-    int pi = i + 1;
-    _qsort_rank(arr, low, pi - 1);
-    _qsort_rank(arr, pi + 1, high);
+    _qsort_rank(arr, low, i);
+    _qsort_rank(arr, i + 2, high);
 }
 
-// =========================================================
-// 2. STATISTICAL TESTS (Robust)
-// =========================================================
+// --- STATS ---
 double norm_cdf(double x) {
     double t = 1.0 / (1.0 + 0.5 * fabs(x));
     double tau = t * exp(-x*x - 1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))));
@@ -82,7 +62,8 @@ double perform_levene(double* g1, int n1, double* g2, int n2) {
     free(z1); free(z2);
     if(ssw<1e-9) return 1.0;
     double f = ssb / (ssw/(n1+n2-2));
-    return 2.0 * norm_cdf(-sqrt(f));
+    double p = 2.0 * norm_cdf(-sqrt(f));
+    return (p > 1.0) ? 1.0 : p; // Clamp
 }
 
 double perform_ks_test(double* g1, int n1, double* g2, int n2) {
@@ -119,69 +100,34 @@ double perform_mann_whitney(double* g1, int n1, double* g2, int n2) {
     free(items);
     double u = r1 - (n1*(n1+1))/2.0;
     double mu = (n1*n2)/2.0; double sig = sqrt(n1*n2*(tn+1)/12.0);
-    return 2.0*norm_cdf(-fabs((u-mu)/sig));
+    double p = 2.0*norm_cdf(-fabs((u-mu)/sig));
+    return (p > 1.0) ? 1.0 : p;
 }
 
-// =========================================================
-// 3. ADVANCED SIGNAL PROCESSING (Improvements #2, #3, #5, #6)
-// =========================================================
-
-// Imp #6: Volume Ticking (Helper)
-double get_avg_volume(double* ohlcv, int n) {
-    double sum = 0;
-    for(int i=0; i<n; i++) sum += ohlcv[i*N_COLS + 4]; // Vol is index 4
-    return sum / n;
-}
-
-// Imp #5: Detrended Returns
-void compute_detrended_returns(double* ohlcv, int n_rows, double* out) {
-    // 1. Compute standard log returns
+// --- CORE LOGIC ---
+void compute_log_returns(double* ohlcv, int n_rows, double* out) {
     for(int i=1; i<n_rows; i++) {
-        double p0 = ohlcv[(i-1)*N_COLS+3];
-        double p1 = ohlcv[i*N_COLS+3];
+        double p0 = ohlcv[(i-1)*N_COLS+3]; double p1 = ohlcv[i*N_COLS+3];
         out[i-1] = log(p1/p0);
     }
-    // 2. Remove Mean (Linear Detrend)
+}
+void compute_detrended_returns(double* ohlcv, int n_rows, double* out) {
+    compute_log_returns(ohlcv, n_rows, out);
     double sum=0; for(int i=0; i<n_rows-1; i++) sum+=out[i];
     double mean = sum/(n_rows-1);
     for(int i=0; i<n_rows-1; i++) out[i] -= mean;
 }
-
-// Imp #2: Hurst Exponent (R/S Analysis)
-int calc_hurst_horizon(double* returns, int max_len) {
-    // Simplified R/S scan: Find where Hurst drops below 0.55
-    // Returns the window length where memory is lost
-    // (Mock logic for brevity, real R/S is complex)
-    return max_len > 252 ? 252 : max_len; // Default to 1 year max
+double get_avg_volume(double* ohlcv, int n) {
+    double sum=0; for(int i=0; i<n; i++) sum+=ohlcv[i*N_COLS+4];
+    return sum/n;
 }
-
-// Imp #3: CUSUM Variance Break
-int detect_variance_break(double* returns, int n) {
-    // Returns index of break, or 0 if none
-    double mean=0, sq=0;
-    for(int i=0; i<n; i++) { mean+=returns[i]; sq+=returns[i]*returns[i]; }
-    double global_var = (sq - mean*mean/n)/n;
-    
-    double cum_sq = 0;
-    for(int i=0; i<n; i++) {
-        cum_sq += returns[i]*returns[i];
-        double local_var = cum_sq / (i+1);
-        if (i > 30 && fabs(local_var - global_var)/global_var > 0.5) return i;
-    }
-    return 0;
-}
-
-// =========================================================
-// 4. PHYSICS ENGINE (Volume Weighted)
-// =========================================================
 
 void check_constraints(SVCJParams* p) {
-    if(p->theta<1e-6) p->theta=1e-6; if(p->sigma_v<0.01) p->sigma_v=0.01;
     if(p->kappa<0.1) p->kappa=0.1; if(p->kappa>50) p->kappa=50;
+    if(p->theta<1e-6) p->theta=1e-6; if(p->sigma_v<0.01) p->sigma_v=0.01;
 }
 
 void estimate_initial_params(double* ohlcv, int n, double dt, SVCJParams* p) {
-    // Garman-Klass
     double s=0;
     for(int i=0; i<n; i++) {
         double H=ohlcv[i*N_COLS+1], L=ohlcv[i*N_COLS+2], O=ohlcv[i*N_COLS], C=ohlcv[i*N_COLS+3];
@@ -194,22 +140,21 @@ void estimate_initial_params(double* ohlcv, int n, double dt, SVCJParams* p) {
     check_constraints(p);
 }
 
-// Pure Likelihood with VOLUME SCALING (Imp #6)
 double ukf_vol_weighted(double* returns, double* vols, int n, double dt, double avg_vol, SVCJParams* p, double* out_spot) {
     double ll=0; double v=p->theta; 
     double var_j = p->mu_j*p->mu_j + p->sigma_j*p->sigma_j;
     
     for(int t=0; t<n; t++) {
-        // Time Dilation: High Vol = More Time
         double vol_scale = (avg_vol > 0) ? vols[t]/avg_vol : 1.0;
         double dt_eff = dt * vol_scale; 
         
         double v_pred = v + p->kappa*(p->theta - v)*dt_eff;
         if(v_pred<1e-9) v_pred=1e-9;
         
-        double y = returns[t]; // Already detrended
-        
+        double y = returns[t];
         double rob_var = v_pred*dt_eff;
+        if(rob_var<1e-12) rob_var=1e-12;
+        
         double pdf_d = (1.0/sqrt(rob_var*2*M_PI))*exp(-0.5*y*y/rob_var);
         
         double tot_j = rob_var + var_j;
@@ -237,14 +182,11 @@ double obj_func_vol(double* ret, double* vol, int n, double dt, double av, SVCJP
 
 void optimize_svcj_vol_weighted(double* ohlcv, int n, double dt, double avg_vol, SVCJParams* p, double* out_spot_vol) {
     estimate_initial_params(ohlcv, n, dt, p);
-    
     double* ret = malloc((n-1)*sizeof(double));
     double* vols = malloc((n-1)*sizeof(double));
     compute_detrended_returns(ohlcv, n, ret);
+    for(int i=1; i<n; i++) vols[i-1] = ohlcv[i*N_COLS+4];
     
-    for(int i=1; i<n; i++) vols[i-1] = ohlcv[i*N_COLS+4]; // Extract Volume
-    
-    // Nelder-Mead (Simplified)
     int n_dim=5; double simplex[6][5]; double scores[6];
     for(int i=0; i<=n_dim; i++) {
         SVCJParams t = *p;
@@ -255,8 +197,7 @@ void optimize_svcj_vol_weighted(double* ohlcv, int n, double dt, double avg_vol,
         simplex[i][3]=t.rho;   simplex[i][4]=t.lambda_j;
         scores[i] = obj_func_vol(ret, vols, n-1, dt, avg_vol, &t);
     }
-    
-    for(int k=0; k<100; k++) { // Short iter for speed
+    for(int k=0; k<100; k++) { 
         int vs[6]; for(int j=0; j<6; j++) vs[j]=j;
         for(int i=0; i<6; i++) { for(int j=i+1; j<6; j++) { if(scores[vs[j]] > scores[vs[i]]) { int tmp=vs[i]; vs[i]=vs[j]; vs[j]=tmp; } } }
         double c[5]={0}; for(int i=0; i<5; i++) { for(int d=0; d<5; d++) c[d]+=simplex[vs[i]][d]; } for(int d=0; d<5; d++) c[d]/=5.0;
@@ -278,30 +219,15 @@ void optimize_svcj_vol_weighted(double* ohlcv, int n, double dt, double avg_vol,
     free(ret); free(vols);
 }
 
-// =========================================================
-// 5. MASTER AUDIT SCAN (Combines all 6 Improvements)
-// =========================================================
+// --- SCANNER ---
 void run_full_audit_scan(double* ohlcv, int total_len, double dt, FidelityMetrics* out) {
-    // 1. Calculate Average Volume (Imp #6)
     double avg_vol = get_avg_volume(ohlcv, total_len);
-    
-    // 2. Define Impulse Window
     int win_imp = 30; 
+    int win_grav = 120;
     
-    // 3. Define Gravity Window using Hurst & CUSUM (Imp #2, #3)
-    // We scan backwards up to 500 bars
-    int scan_len = (total_len > 500) ? 500 : total_len;
-    // For now, simplify to Disjoint Separation (Imp #1)
-    int win_grav = 120; // Default
-    // Check break
-    // int break_idx = detect_variance_break(...) -> logic here
-    
-    // Ensure Disjoint (Imp #1)
-    // Impulse: [End-30 : End]
-    // Gravity: [End-150 : End-30]
     if (total_len < win_imp + win_grav) { out->is_valid=0; return; }
     
-    // 4. Fit Gravity (Volume Weighted)
+    // Fit Gravity
     SVCJParams p_grav;
     int grav_start = total_len - win_imp - win_grav;
     double* spot_grav = malloc((win_grav-1)*sizeof(double));
@@ -310,7 +236,7 @@ void run_full_audit_scan(double* ohlcv, int total_len, double dt, FidelityMetric
     out->fit_theta = p_grav.theta; out->fit_kappa = p_grav.kappa;
     out->fit_sigma_v = p_grav.sigma_v; out->fit_rho = p_grav.rho; out->fit_lambda = p_grav.lambda_j;
     
-    // 5. Fit Impulse (Volume Weighted)
+    // Fit Impulse
     SVCJParams p_imp;
     int imp_start = total_len - win_imp;
     double* spot_imp = malloc((win_imp-1)*sizeof(double));
@@ -319,29 +245,22 @@ void run_full_audit_scan(double* ohlcv, int total_len, double dt, FidelityMetric
     double kinetic = spot_imp[win_imp-2];
     out->energy_ratio = (kinetic*kinetic) / p_grav.theta;
     
-    // 6. Non-Parametric Battery
-    // Prepare arrays
+    // Non-Parametrics
     double* ret_grav = malloc((win_grav-1)*sizeof(double));
-    compute_detrended_returns(ohlcv + grav_start*N_COLS, win_grav, ret_grav); // Imp #5 Detrending
+    compute_detrended_returns(ohlcv + grav_start*N_COLS, win_grav, ret_grav);
     
     double* ret_imp = malloc((win_imp-1)*sizeof(double));
     compute_detrended_returns(ohlcv + imp_start*N_COLS, win_imp, ret_imp);
     
-    // Tests
     out->levene_p = perform_levene(ret_imp, win_imp-1, ret_grav, win_grav-1);
     out->mw_p = perform_mann_whitney(ret_imp, win_imp-1, ret_grav, win_grav-1);
     out->ks_ret_p = perform_ks_test(ret_imp, win_imp-1, ret_grav, win_grav-1);
-    
-    // Imp #4: Vol-Path KS Test
     out->ks_vol_p = perform_ks_test(spot_imp, win_imp-1, spot_grav, win_grav-1);
     
     out->residue_median = calc_median(ret_imp, win_imp-1);
     out->win_impulse = win_imp;
     out->win_gravity = win_grav;
     
-    // VALIDATION LOGIC
-    // Struct Break: Levene (Energy) OR KS_Vol (Vol Shape) < 0.05
-    // Direction: MW (Drift) < 0.10
     int struct_break = (out->levene_p < 0.05 || out->ks_vol_p < 0.05);
     int dir_break = (out->mw_p < 0.10);
     out->is_valid = (struct_break && dir_break) ? 1 : 0;
@@ -349,16 +268,14 @@ void run_full_audit_scan(double* ohlcv, int total_len, double dt, FidelityMetric
     free(spot_grav); free(spot_imp); free(ret_grav); free(ret_imp);
 }
 
-// --- Instant Filter (Vol Weighted) ---
 void run_instant_filter_vol(double ret, double vol, double avg_vol, double dt, SVCJParams* p, double* state, InstantState* out) {
     double vol_scale = (avg_vol > 0) ? vol/avg_vol : 1.0;
     double dt_eff = dt * vol_scale;
-    
     double v_curr = *state;
     double v_pred = v_curr + p->kappa*(p->theta - v_curr)*dt_eff;
     if(v_pred<1e-9) v_pred=1e-9;
     
-    double y = ret; // Assumed detrended or 0 drift
+    double y = ret; 
     double jump_var = p->lambda_j*(p->mu_j*p->mu_j + p->sigma_j*p->sigma_j);
     double std = sqrt((v_pred + jump_var)*dt_eff);
     if(std<1e-9) std=1e-9;
@@ -370,10 +287,8 @@ void run_instant_filter_vol(double ret, double vol, double avg_vol, double dt, S
     if(v_new<1e-9) v_new=1e-9;
     
     out->current_spot_vol = sqrt(v_new);
-    // Jump Prob
     double pdf = (1.0/sqrt(2*M_PI*v_pred*dt_eff))*exp(-0.5*y*y/(v_pred*dt_eff));
     double pr = p->lambda_j*dt_eff;
     out->current_jump_prob = pr / (pr + pdf*(1-pr));
-    
     *state = v_new;
 }

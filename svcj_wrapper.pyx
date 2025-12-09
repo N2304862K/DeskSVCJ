@@ -10,10 +10,14 @@ cdef extern from "svcj.h":
     ctypedef struct InstantState:
         double current_spot_vol, current_jump_prob, innovation_z_score
     ctypedef struct FidelityMetrics:
-        int win_impulse, win_gravity, is_valid
-        double energy_ratio, residue_median
+        # EXACT ORDER FROM C HEADER
+        double energy_ratio
+        double residue_median
         double levene_p, mw_p, ks_ret_p, ks_vol_p
+        
         double fit_theta, fit_kappa, fit_sigma_v, fit_rho, fit_lambda
+        
+        int win_impulse, win_gravity, is_valid
     
     void run_full_audit_scan(double* ohlcv, int total_len, double dt, FidelityMetrics* out) nogil
     void run_instant_filter_vol(double ret, double vol, double avg, double dt, SVCJParams* p, double* state, InstantState* out) nogil
