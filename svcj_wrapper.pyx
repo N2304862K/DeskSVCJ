@@ -10,34 +10,52 @@ cdef extern from "svcj.h":
     ctypedef struct InstantState:
         double current_spot_vol, current_jump_prob, innovation_z_score
     ctypedef struct FidelityMetrics:
-        int win_impulse, win_gravity, is_valid
-        double energy_ratio, residue_bias
-        double levene_p, mw_p, ks_p
+        int is_valid
+        double energy_ratio, residue_bias, f_p_value, t_p_value
         double fit_theta, fit_kappa, fit_sigma_v, fit_rho, fit_lambda
+    ctypedef struct ValidationReport:
+        double theta_std_err, kappa_std_err, jb_p_value, vov_ratio
     
-    void run_nonparametric_scan(double* ohlcv, int total_len, double dt, FidelityMetrics* out) nogil
+    void run_fidelity_scan(double* ohlcv, int total_len, double dt, FidelityMetrics* out) nogil
+    void validate_fidelity(double* ohlcv, int n, double dt, SVCJParams* p, ValidationReport* out) nogil
     void run_instant_filter(double r, double dt, SVCJParams* p, double* state, InstantState* out) nogil
 
 cdef np.ndarray[double, ndim=2, mode='c'] _sanitize(object d):
     return np.ascontiguousarray(np.asarray(d, dtype=np.float64))
 
-def scan_robust_fidelity(object ohlcv, double dt):
+def scan_fidelity_enhanced(object ohlcv, double dt):
     cdef np.ndarray[double, ndim=2, mode='c'] data = _sanitize(ohlcv)
     cdef int n = data.shape[0]
     if n < 120: return None
     
     cdef FidelityMetrics m
+    cdef SVCJParams p_export
+    cdef ValidationReport v
+    
     with nogil:
-        run_nonparametric_scan(&data[0,0], n, dt, &m)
+        # Run Scan
+        run_fidelity_scan(&data[0,0], n, dt, &m)
         
+        # Re-populate Params for Validation Call
+        p_export.theta = m.fit_theta
+        p_export.kappa = m.fit_kappa
+        p_export.sigma_v = m.fit_sigma_v
+        p_export.rho = m.fit_rho
+        p_export.lambda_j = m.fit_lambda
+        p_export.mu = 0; p_export.mu_j = 0; p_export.sigma_j = np.sqrt(m.fit_theta)
+        
+        # Run Validation
+        validate_fidelity(&data[n-120,0], 120, dt, &p_export, &v)
+    
     return {
         "energy_ratio": m.energy_ratio,
-        "residue_median": m.residue_bias,
+        "residue_bias": m.residue_bias,
         "is_valid": bool(m.is_valid),
-        "stats": {
-            "levene_p": m.levene_p, # Volatility Break
-            "mw_p": m.mw_p,         # Directional Break
-            "ks_p": m.ks_p          # Structural Break
+        "validation": {
+            "theta_err": v.theta_std_err,
+            "kappa_err": v.kappa_std_err,
+            "jb_prob": v.jb_p_value,
+            "vov_consistency": v.vov_ratio
         },
         "params": {
             "theta": m.fit_theta, "kappa": m.fit_kappa, "sigma_v": m.fit_sigma_v,
