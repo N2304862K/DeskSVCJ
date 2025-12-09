@@ -19,14 +19,12 @@ def scan_advanced_fidelity(object ohlcv, double dt):
     cdef np.ndarray[double, ndim=2, mode='c'] data = _sanitize(ohlcv)
     cdef int n = data.shape[0]
     
-    # Needs sufficient history for disjoint (Grav + Imp)
-    # Imp=30, Grav=120 -> 150 min
+    # Needs sufficient history: Grav(120) + Imp(30)
     if n < 160: return None
     
     cdef FidelityMetrics m
     
     with nogil:
-        # Fixed Windows: Gravity 120, Impulse 30
         run_fidelity_scan_advanced(&data[0,0], n, 120, 30, dt, &m)
         
     return {
