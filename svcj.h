@@ -7,43 +7,43 @@
 #include <string.h>
 
 #define NM_ITER 300
-#define N_COLS 5
+#define N_COLS 5 // Open, High, Low, Close, Volume
 
 typedef struct {
     double mu, kappa, theta, sigma_v, rho, lambda_j, mu_j, sigma_j;
 } SVCJParams;
 
 typedef struct {
-    double current_spot_vol;
-    double current_jump_prob;
-    double innovation_z_score;
-} InstantState;
-
-typedef struct {
+    // Physical Metrics
+    int win_impulse;
+    int win_gravity;
     double energy_ratio;
-    double residue_bias;
-    double f_p_value;    // Levene (Volume-Weighted)
-    double t_p_value;    // Mann-Whitney (Raw)
-    int is_valid;
+    double hurst_exponent; // Improvement 2
     
-    // Physics Export
-    double fit_theta, fit_kappa, fit_sigma_v, fit_rho, fit_lambda;
+    // Robust Stats (Non-Parametric)
+    double levene_p;       // Energy Validity
+    double mw_p;           // Direction Validity (Raw)
+    double ks_p_vol;       // Dist Match: Spot Vol (Impulse) vs Spot Vol (Gravity) (Imp 4)
+    
+    // Result
+    int is_valid;
+    double residue_median; // From Raw Returns
+    
+    // Physics Payload
+    double fit_theta;
 } FidelityMetrics;
 
-// Utils
-void compute_log_returns(double* ohlcv, int n_rows, double* out_returns);
-void compute_vol_weighted_returns(double* ohlcv, int n_rows, double avg_vol, double* out_returns);
-double get_avg_volume(double* ohlcv, int n);
+// --- Sort Utils ---
+void sort_doubles_fast(double* arr, int n);
 
-// Sort
-void sort_doubles(double* arr, int n);
+// --- Core ---
+// Improvement 5: Detrending logic
+void prepare_data(double* ohlcv, int n, double* out_raw_ret, double* out_detrend_ret, double* out_vol_weights);
 
-// Core
-void estimate_initial_params(double* ohlcv, int n, double dt, SVCJParams* p);
-void optimize_svcj_vol(double* ohlcv, int n, double dt, double avg_vol, SVCJParams* p, double* out_spot_vol);
+// Optimization (Volume Aware)
+void optimize_svcj_vol(double* returns, double* vol_weights, int n, double base_dt, SVCJParams* p, double* out_spot);
 
 // Engines
-void run_full_audit_scan(double* ohlcv, int total_len, double dt, FidelityMetrics* out);
-void run_instant_filter_vol(double ret, double vol, double avg_vol, double dt, SVCJParams* p, double* state, InstantState* out);
+void run_enhanced_scan(double* ohlcv, int total_len, double base_dt, FidelityMetrics* out);
 
 #endif
