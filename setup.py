@@ -1,31 +1,21 @@
 from setuptools import setup, Extension
 from Cython.Build import cythonize
-import sys
-import os
+import numpy, sys
 
-# --- THIS SECTION REQUIRES NUMPY TO BE PRE-INSTALLED ---
-import numpy
+# Ensure numpy is installed
+setup_requires = ['numpy']
 
-# Platform specific OpenMP flags
 if sys.platform.startswith("win"):
-    compile_args = ["/openmp"]
-    link_args = []
+    args = ["/openmp"]
 else:
-    compile_args = ["-fopenmp"]
-    link_args = ["-fopenmp"]
+    args = ["-fopenmp"]
 
-extensions = [
-    Extension(
-        "svcj_wrapper",
-        sources=["svcj_wrapper.pyx", "svcj.c"],
-        include_dirs=[numpy.get_include(), "."],
-        extra_compile_args=compile_args,
-        extra_link_args=link_args,
-    )
-]
+ext = [Extension("svcj_wrapper", ["svcj_wrapper.pyx", "svcj.c"], include_dirs=[numpy.get_include(), "."], extra_compile_args=args, extra_link_args=args)]
 
 setup(
-    name="SVCJ_Factor_Engine",
-    ext_modules=cythonize(extensions, compiler_directives={'language_level': "3"}),
+    name="SVCJ_Factor_Engine", 
+    ext_modules=cythonize(ext), 
     zip_safe=False,
+    setup_requires=setup_requires,
+    install_requires=['numpy>=1.20.0', 'pandas>=1.3.0']
 )
