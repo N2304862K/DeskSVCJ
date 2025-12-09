@@ -1,114 +1,39 @@
 #include "svcj.h"
 #include <float.h>
 
-// =========================================================
-// HIGH-PERFORMANCE SORTING ENGINE (No Function Pointers)
-// =========================================================
-
-// 1. Insertion Sort (Fastest for N < 16)
-static void _isort_dbl(double* arr, int n) {
-    for (int i = 1; i < n; i++) {
-        double key = arr[i];
-        int j = i - 1;
-        while (j >= 0 && arr[j] > key) {
-            arr[j + 1] = arr[j];
-            j = j - 1;
-        }
-        arr[j + 1] = key;
-    }
+// --- SORTING HELPERS ---
+int compare_doubles(const void* a, const void* b) {
+    double arg1 = *(const double*)a;
+    double arg2 = *(const double*)b;
+    if (arg1 < arg2) return -1;
+    if (arg1 > arg2) return 1;
+    return 0;
 }
 
-// 2. Median-of-3 QuickSort (Recursive)
-static void _qsort_dbl(double* arr, int low, int high) {
-    if (low >= high) return;
-    
-    // Fallback to Insertion Sort for small partitions (CPU Cache Optimization)
-    if (high - low < 16) {
-        _isort_dbl(arr + low, high - low + 1);
-        return;
-    }
-
-    double pivot = arr[high];
-    int i = (low - 1);
-
-    for (int j = low; j <= high - 1; j++) {
-        if (arr[j] <= pivot) {
-            i++;
-            double temp = arr[i]; arr[i] = arr[j]; arr[j] = temp;
-        }
-    }
-    double temp = arr[i + 1]; arr[i + 1] = arr[high]; arr[high] = temp;
-    int pi = i + 1;
-
-    _qsort_dbl(arr, low, pi - 1);
-    _qsort_dbl(arr, pi + 1, high);
-}
-
-// Public API
-void sort_doubles_fast(double* arr, int n) {
-    _qsort_dbl(arr, 0, n - 1);
-}
-
-// --- Specialized Rank Sort (For Mann-Whitney) ---
-static void _isort_rank(RankItem* arr, int n) {
-    for (int i = 1; i < n; i++) {
-        RankItem key = arr[i];
-        int j = i - 1;
-        while (j >= 0 && arr[j].val > key.val) {
-            arr[j + 1] = arr[j];
-            j--;
-        }
-        arr[j + 1] = key;
-    }
-}
-
-static void _qsort_rank(RankItem* arr, int low, int high) {
-    if (low >= high) return;
-    if (high - low < 16) {
-        _isort_rank(arr + low, high - low + 1);
-        return;
-    }
-    double pivot = arr[high].val;
-    int i = (low - 1);
-    for (int j = low; j <= high - 1; j++) {
-        if (arr[j].val <= pivot) {
-            i++;
-            RankItem temp = arr[i]; arr[i] = arr[j]; arr[j] = temp;
-        }
-    }
-    RankItem temp = arr[i + 1]; arr[i + 1] = arr[high]; arr[high] = temp;
-    int pi = i + 1;
-    _qsort_rank(arr, low, pi - 1);
-    _qsort_rank(arr, pi + 1, high);
-}
-
-void sort_ranks_fast(RankItem* arr, int n) {
-    _qsort_rank(arr, 0, n - 1);
-}
-
-// =========================================================
-// STATISTICAL TESTS (Using Fast Sort)
-// =========================================================
-
+// --- STATISTICAL FUNCTIONS ---
 double norm_cdf(double x) {
     double t = 1.0 / (1.0 + 0.5 * fabs(x));
     double tau = t * exp(-x*x - 1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))));
     return x >= 0 ? tau : 2.0 - tau;
 }
 
+// 1. Median Calculator (Requires Sort)
 double calc_median(double* data, int n) {
     double* sorted = malloc(n * sizeof(double));
     memcpy(sorted, data, n * sizeof(double));
-    sort_doubles_fast(sorted, n); // FAST SORT
+    qsort(sorted, n, sizeof(double), compare_doubles);
     double med = (n % 2 == 0) ? (sorted[n/2 - 1] + sorted[n/2]) / 2.0 : sorted[n/2];
     free(sorted);
     return med;
 }
 
+// 2. Levene's Test (Brown-Forsythe: Robust F-Test)
+// Tests equality of variances using absolute deviation from median
 double perform_levene_test(double* group1, int n1, double* group2, int n2) {
     double med1 = calc_median(group1, n1);
     double med2 = calc_median(group2, n2);
     
+    // Transform to absolute deviations (Z)
     double* z1 = malloc(n1 * sizeof(double));
     double* z2 = malloc(n2 * sizeof(double));
     double sum_z1=0, sum_z2=0;
@@ -120,26 +45,45 @@ double perform_levene_test(double* group1, int n1, double* group2, int n2) {
     double mean_z2 = sum_z2/n2;
     double grand_mean = (sum_z1 + sum_z2) / (n1 + n2);
     
+    // ANOVA on Z
     double ssb = n1*(mean_z1-grand_mean)*(mean_z1-grand_mean) + n2*(mean_z2-grand_mean)*(mean_z2-grand_mean);
     double ssw = 0;
     for(int i=0; i<n1; i++) ssw += (z1[i]-mean_z1)*(z1[i]-mean_z1);
     for(int i=0; i<n2; i++) ssw += (z2[i]-mean_z2)*(z2[i]-mean_z2);
     
     free(z1); free(z2);
-    if (ssw < 1e-9) return 1.0;
-    double f = ssb / (ssw / (n1 + n2 - 2));
-    return 2.0 * norm_cdf(-sqrt(f));
+    
+    if (ssw < 1e-9) return 1.0; // Identical
+    double f = (ssb / 1.0) / (ssw / (n1 + n2 - 2));
+    
+    // F-Test P-Value (Approx)
+    // Degrees of Freedom: (1, N-2)
+    // Use Normal Approx for simplicity in C
+    return 2.0 * norm_cdf(-sqrt(f)); // Rough p-value
 }
 
+// 3. Mann-Whitney U Test (Robust T-Test)
+// Tests shift in location (Median difference)
 double perform_mann_whitney(double* group1, int n1, double* group2, int n2) {
     int total_n = n1 + n2;
+    
+    // Create combined rank array
+    typedef struct { double val; int group; double rank; } RankItem;
     RankItem* items = malloc(total_n * sizeof(RankItem));
     
     for(int i=0; i<n1; i++) { items[i].val = group1[i]; items[i].group = 1; }
     for(int i=0; i<n2; i++) { items[n1+i].val = group2[i]; items[n1+i].group = 2; }
     
-    sort_ranks_fast(items, total_n); // FAST SORT
+    // Sort by value to assign ranks
+    // Need custom comparator for struct
+    int compare_ranks(const void* a, const void* b) {
+        double v1 = ((RankItem*)a)->val;
+        double v2 = ((RankItem*)b)->val;
+        return (v1 > v2) - (v1 < v2);
+    }
+    qsort(items, total_n, sizeof(RankItem), compare_ranks);
     
+    // Assign Ranks (Handle ties)
     for(int i=0; i<total_n; ) {
         int j = i;
         while(j < total_n && items[j].val == items[i].val) j++;
@@ -148,50 +92,64 @@ double perform_mann_whitney(double* group1, int n1, double* group2, int n2) {
         i = j;
     }
     
+    // Sum Ranks for Group 1
     double r1 = 0;
     for(int i=0; i<total_n; i++) {
         if(items[i].group == 1) r1 += items[i].rank;
     }
+    
     free(items);
     
+    // U Statistic
     double u1 = r1 - (n1*(n1+1))/2.0;
     double u2 = (n1*n2) - u1;
-    double u = (u1 < u2) ? u1 : u2;
+    double u = (u1 < u2) ? u1 : u2; // Minimum U
     
+    // Z-Score approximation
     double mu_u = (n1*n2)/2.0;
     double sigma_u = sqrt((n1*n2*(n1+n2+1))/12.0);
     double z = (u - mu_u) / sigma_u;
-    return 2.0 * norm_cdf(-fabs(z));
+    
+    return 2.0 * norm_cdf(-fabs(z)); // P-Value
 }
 
+// 4. Kolmogorov-Smirnov Test (Regime Shape)
 double perform_ks_test(double* group1, int n1, double* group2, int n2) {
     double* s1 = malloc(n1 * sizeof(double)); memcpy(s1, group1, n1*sizeof(double));
     double* s2 = malloc(n2 * sizeof(double)); memcpy(s2, group2, n2*sizeof(double));
-    
-    sort_doubles_fast(s1, n1); // FAST SORT
-    sort_doubles_fast(s2, n2); // FAST SORT
+    qsort(s1, n1, sizeof(double), compare_doubles);
+    qsort(s2, n2, sizeof(double), compare_doubles);
     
     double max_d = 0.0;
     int i=0, j=0;
     while(i < n1 && j < n2) {
-        double d1 = s1[i]; double d2 = s2[j];
+        double d1 = s1[i];
+        double d2 = s2[j];
         double cdf1 = (double)(i) / n1;
         double cdf2 = (double)(j) / n2;
+        
         double diff = fabs(cdf1 - cdf2);
         if (diff > max_d) max_d = diff;
-        if (d1 <= d2) i++; else j++;
+        
+        if (d1 <= d2) i++;
+        else j++;
     }
+    
     free(s1); free(s2);
     
+    // Kolmogorov distribution approx
     double ne = (double)(n1*n2)/(n1+n2);
     double lambda = (sqrt(ne) + 0.12 + 0.11/sqrt(ne)) * max_d;
+    // P-Value approx: 2 * sum (-1)^(k-1) * exp(-2*k^2*lambda^2)
     double p = 0.0;
-    for(int k=1; k<=5; k++) p += 2 * pow(-1, k-1) * exp(-2*k*k*lambda*lambda);
+    for(int k=1; k<=5; k++) {
+        p += 2 * pow(-1, k-1) * exp(-2*k*k*lambda*lambda);
+    }
     if (p < 0) p = 0; if (p > 1) p = 1;
-    return p;
+    return p; // KS P-Value: Small means distributions are DIFFERENT
 }
 
-// --- STANDARD SVCJ LOGIC ---
+// --- SVCJ CORE (Standard) ---
 void compute_log_returns(double* ohlcv, int n_rows, double* out_returns) {
     for(int i=1; i<n_rows; i++) {
         double prev = ohlcv[(i-1)*N_COLS+3]; double curr = ohlcv[i*N_COLS+3];
@@ -235,8 +193,7 @@ double ukf_pure_likelihood(double* returns, int n, double dt, SVCJParams* p, dou
         double y = returns[t] - (p->mu - 0.5*v_pred)*dt;
         double rob_var = (v_pred<1e-9)?1e-9:v_pred; rob_var*=dt;
         double pdf_d = (1.0/sqrt(rob_var*2*M_PI))*exp(-0.5*y*y/rob_var);
-        double tot_j = rob_var+var_j; 
-        double yj = y - p->mu_j;
+        double tot_j = rob_var+var_j; double yj=y-p->mu_j;
         double pdf_j = (1.0/sqrt(tot_j*2*M_PI))*exp(-0.5*yj*yj/tot_j);
         double prior = p->lambda_j*dt; if(prior>0.999) prior=0.999;
         double den = pdf_j*prior + pdf_d*(1.0-prior);
@@ -261,7 +218,6 @@ void optimize_svcj(double* ohlcv, int n, double dt, SVCJParams* p, double* out_s
     double* ret = malloc((n-1)*sizeof(double));
     if(!ret) return;
     compute_log_returns(ohlcv, n, ret);
-    
     int n_dim=5; double simplex[6][5]; double scores[6];
     for(int i=0; i<=n_dim; i++) {
         SVCJParams t = *p;
@@ -292,43 +248,64 @@ void optimize_svcj(double* ohlcv, int n, double dt, SVCJParams* p, double* out_s
     int best=0; for(int i=1; i<6; i++) if(scores[i]>scores[best]) best=i;
     p->kappa=simplex[best][0]; p->theta=simplex[best][1]; p->sigma_v=simplex[best][2];
     p->rho=simplex[best][3];   p->lambda_j=simplex[best][4];
-    
     if(out_spot_vol) ukf_pure_likelihood(ret, n-1, dt, p, out_spot_vol, out_jump_prob);
     free(ret);
 }
 
+// --- NON-PARAMETRIC ENGINE ---
 void run_nonparametric_scan(double* ohlcv, int total_len, double dt, FidelityMetrics* out) {
     int win_imp = 30; int win_grav = win_imp * 4;
     if (total_len < win_grav) { out->is_valid=0; return; }
     
+    // 1. Gravity (Long)
     SVCJParams p_grav;
-    optimize_svcj(ohlcv + (total_len-win_grav)*N_COLS, win_grav, dt, &p_grav, NULL, NULL);
-    out->fit_theta = p_grav.theta; out->fit_kappa = p_grav.kappa;
-    out->fit_sigma_v = p_grav.sigma_v; out->fit_rho = p_grav.rho; out->fit_lambda = p_grav.lambda_j;
+    int start_grav = total_len - win_grav;
+    optimize_svcj(ohlcv + start_grav*N_COLS, win_grav, dt, &p_grav, NULL, NULL);
     
+    // Export Physics
+    out->fit_theta = p_grav.theta;
+    out->fit_kappa = p_grav.kappa;
+    out->fit_sigma_v = p_grav.sigma_v;
+    out->fit_rho = p_grav.rho;
+    out->fit_lambda = p_grav.lambda_j;
+    
+    // 2. Impulse (Short)
     SVCJParams p_imp;
+    int start_imp = total_len - win_imp;
     double* imp_spot = malloc((win_imp-1)*sizeof(double));
-    optimize_svcj(ohlcv + (total_len-win_imp)*N_COLS, win_imp, dt, &p_imp, imp_spot, NULL);
+    optimize_svcj(ohlcv + start_imp*N_COLS, win_imp, dt, &p_imp, imp_spot, NULL);
     out->energy_ratio = (imp_spot[win_imp-2]*imp_spot[win_imp-2]) / p_grav.theta;
     
+    // 3. Prepare Data for Non-Parametric Tests
     double* ret_long = malloc((win_grav-1)*sizeof(double));
-    compute_log_returns(ohlcv + (total_len-win_grav)*N_COLS, win_grav, ret_long);
+    compute_log_returns(ohlcv + start_grav*N_COLS, win_grav, ret_long);
     
+    // Slice out the Impulse part of the returns
     double* ret_short = malloc((win_imp-1)*sizeof(double));
-    compute_log_returns(ohlcv + (total_len-win_imp)*N_COLS, win_imp, ret_short);
+    compute_log_returns(ohlcv + start_imp*N_COLS, win_imp, ret_short);
     
-    // Robust Tests
+    // 4. Robust Tests
+    // Levene's (Energy Expansion)
     out->levene_p = perform_levene_test(ret_short, win_imp-1, ret_long, win_grav-1);
+    
+    // Mann-Whitney (Directional Shift)
     out->mw_p = perform_mann_whitney(ret_short, win_imp-1, ret_long, win_grav-1);
+    
+    // KS (Regime Shape)
     out->ks_p = perform_ks_test(ret_short, win_imp-1, ret_long, win_grav-1);
-    out->residue_median = calc_median(ret_short, win_imp-1);
+    
+    // Median Residue (Direction)
+    out->residue_bias = calc_median(ret_short, win_imp-1);
     
     out->win_impulse = win_imp;
     out->win_gravity = win_grav;
     
-    // VALIDITY: Energy(Levene) OR Shape(KS) changed, AND Direction(MW) is significant
+    // VALIDITY LOGIC (Robust)
+    // 1. Levene < 0.05 (Variance Changed) OR KS < 0.05 (Shape Changed)
+    // 2. MW < 0.10 (Direction Changed)
     int struct_break = (out->levene_p < 0.05 || out->ks_p < 0.05);
     int dir_break = (out->mw_p < 0.10);
+    
     out->is_valid = (struct_break && dir_break) ? 1 : 0;
     
     free(imp_spot); free(ret_long); free(ret_short);
