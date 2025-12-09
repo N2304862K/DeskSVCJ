@@ -14,22 +14,28 @@ typedef struct {
 } SVCJParams;
 
 typedef struct {
-    // Physics
-    double energy_ratio;    // Model Kinetic / Model Potential
-    double residue_bias;    // Direction
-    double hurst_exponent;  // Persistence
+    double energy_ratio;    // Theta_Impulse / Theta_Gravity
+    double residue_bias;
+    double hurst_exponent;  // On Raw Returns (valid)
     
-    // Statistics
-    double realized_f_stat; // Realized Var Impulse / Realized Var Gravity
-    double f_p_value;       // Significance of Expansion
-    double ks_stat;         // Distribution Shift
-    double jb_p;            // Tail Risk Significance
+    double ks_stat;
+    double levene_p;
+    double jb_p;
     
     int is_valid;
 } FidelityMetrics;
 
-void compute_volume_weighted_returns(double* ohlcv, int n, double* out_ret);
-void optimize_svcj_volume(double* returns, double* volumes, int n, double dt, SVCJParams* p, double* out_spot);
-void run_fidelity_scan_advanced(double* ohlcv, int total_len, int w_grav, int w_imp, double dt, FidelityMetrics* out);
+// Core
+void compute_log_returns(double* ohlcv, int n, double* out_ret, double* out_vol);
+
+// Optimization
+double ukf_volume_likelihood(double* ret, double* vol, int n, double dt, double avg_vol, SVCJParams* p);
+void optimize_svcj(double* ret, double* vol, int n, double dt, SVCJParams* p);
+
+// Pipeline
+void run_fidelity_scan_native(double* ohlcv, int total_len, int w_grav, int w_imp, double dt, FidelityMetrics* out);
+
+// Helpers
+void sort_doubles_fast(double* arr, int n);
 
 #endif
