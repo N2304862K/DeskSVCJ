@@ -3,63 +3,40 @@
 
 import numpy as np
 cimport numpy as np
-from cpython.pycapsule cimport PyCapsule_New, PyCapsule_GetPointer
+from libc.stdlib cimport malloc, free
 
 cdef extern from "svcj.h":
-    ctypedef struct EvolvingSystemState:
-        pass
-    ctypedef struct InstantMetrics:
-        double expected_return, expected_vol, escape_velocity, swarm_entropy
+    ctypedef struct BreakoutSignal:
+        double ks_stat, p_value, energy_ratio, drift_z_score
+        int is_breakout
         
-    EvolvingSystemState* initialize_system(double* ohlcv, int n, double dt, int n_p) nogil
-    void run_system_step(EvolvingSystemState* state, double ret, double vol, InstantMetrics* out) nogil
-    void cleanup_system(EvolvingSystemState* state) nogil
+    void run_hierarchical_scan(double* ohlcv, int len_long, int len_short, double dt, int n_particles, BreakoutSignal* out) nogil
 
-# --- The Stateless Interface (Correct & Safe) ---
+cdef np.ndarray[double, ndim=2, mode='c'] _sanitize(object d):
+    return np.ascontiguousarray(np.asarray(d, dtype=np.float64))
 
-# This is the C function that will be called by the PyCapsule destructor
-cdef void capsule_cleanup(object capsule):
-    # Get the C pointer from the capsule and call our cleanup function
-    cdef EvolvingSystemState* state_ptr = <EvolvingSystemState*>PyCapsule_GetPointer(capsule, "EvolvingSystemState")
-    if state_ptr is not NULL:
-        cleanup_system(state_ptr)
-
-def initialize_engine(object ohlcv, double dt, int num_particles=1500):
+def scan_hierarchical(object ohlcv, int win_long, int win_short, double dt, int n_particles=500):
     """
-    Initializes the C-Core state and returns a safe Python handle (PyCapsule).
+    Runs the Hierarchical Swarm Analysis (Gravity vs Impulse).
     """
-    cdef np.ndarray[double, ndim=2, mode='c'] data = np.ascontiguousarray(ohlcv, dtype=np.float64)
+    cdef np.ndarray[double, ndim=2, mode='c'] data = _sanitize(ohlcv)
     cdef int n = data.shape[0]
     
-    # Call the C initializer
-    cdef EvolvingSystemState* state_ptr
-    with nogil:
-        state_ptr = initialize_system(&data[0,0], n, dt, num_particles)
+    if n < win_long: win_long = n
+    if win_long < win_short + 10: return None
         
-    if state_ptr is NULL:
-        raise MemoryError("Failed to initialize C-Core state.")
-        
-    # Create a PyCapsule to safely manage the pointer in Python
-    # It stores the pointer and a destructor function
-    return PyCapsule_New(state_ptr, "EvolvingSystemState", capsule_cleanup)
-
-def run_engine_step(object capsule, double new_ret, double new_vol):
-    """
-    Takes the Python handle, runs one step in the C-Core, returns metrics.
-    """
-    cdef EvolvingSystemState* state_ptr = <EvolvingSystemState*>PyCapsule_GetPointer(capsule, "EvolvingSystemState")
-    if state_ptr is NULL:
-        raise ValueError("Invalid Engine Handle.")
-        
-    cdef InstantMetrics metrics
+    cdef BreakoutSignal s
     
-    # Call the C update function
-    with nogil:
-        run_system_step(state_ptr, new_ret, new_vol, &metrics)
+    # Pass pointer to START of long window
+    cdef int start_idx = n - win_long
     
+    with nogil:
+        run_hierarchical_scan(&data[start_idx, 0], win_long, win_short, dt, n_particles, &s)
+        
     return {
-        "ev_ret": metrics.expected_return,
-        "ev_vol": metrics.expected_vol,
-        "escape": metrics.escape_velocity,
-        "entropy": metrics.swarm_entropy
+        "ks_stat": s.ks_stat,
+        "p_value": s.p_value,
+        "energy_ratio": s.energy_ratio,
+        "drift": s.drift_z_score,
+        "is_breakout": bool(s.is_breakout)
     }
