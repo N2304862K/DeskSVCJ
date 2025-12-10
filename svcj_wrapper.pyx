@@ -23,7 +23,7 @@ cdef np.ndarray[double, ndim=2, mode='c'] _sanitize(object d):
 # --- The Particle Filter Class ---
 cdef class ParticleFilter:
     cdef Particle* swarm
-    cdef double dt
+    cdef public double dt  # <<< FIX: 'public' makes this accessible from Python
     cdef int swarm_size
     
     def __cinit__(self, object ohlcv, double dt):
@@ -34,14 +34,12 @@ cdef class ParticleFilter:
         cdef int n = data.shape[0]
         self.swarm_size = 5000
         
-        # Allocate C-memory for the swarm
         self.swarm = <Particle*> malloc(self.swarm_size * sizeof(Particle))
         if self.swarm is NULL:
             raise MemoryError()
             
         self.dt = dt
         
-        # Call C-Core to generate the Prior
         generate_prior_swarm(&data[0,0], n, dt, self.swarm)
         
     def __dealloc__(self):
