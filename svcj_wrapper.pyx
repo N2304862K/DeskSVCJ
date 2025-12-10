@@ -3,49 +3,63 @@
 
 import numpy as np
 cimport numpy as np
-from libc.stdlib cimport malloc, free
+from cpython.pycapsule cimport PyCapsule_New, PyCapsule_GetPointer
 
 cdef extern from "svcj.h":
     ctypedef struct EvolvingSystemState:
         pass
     ctypedef struct InstantMetrics:
-        double expected_return, expected_vol, escape_velocity, surprise_index, swarm_entropy
+        double expected_return, expected_vol, escape_velocity, swarm_entropy
         
-    void initialize_system(double* ohlcv, int n, double dt, int n_p, EvolvingSystemState* out) nogil
+    EvolvingSystemState* initialize_system(double* ohlcv, int n, double dt, int n_p) nogil
     void run_system_step(EvolvingSystemState* state, double ret, double vol, InstantMetrics* out) nogil
+    void cleanup_system(EvolvingSystemState* state) nogil
 
-cdef np.ndarray[double, ndim=2, mode='c'] _sanitize(object d):
-    return np.ascontiguousarray(np.asarray(d, dtype=np.float64))
+# --- The Stateless Interface (Correct & Safe) ---
 
-# --- The Main Class: Evolving Particle Filter ---
-cdef class EvolvingEngine:
-    cdef EvolvingSystemState* state # Pointer to C-managed state
+# This is the C function that will be called by the PyCapsule destructor
+cdef void capsule_cleanup(object capsule):
+    # Get the C pointer from the capsule and call our cleanup function
+    cdef EvolvingSystemState* state_ptr = <EvolvingSystemState*>PyCapsule_GetPointer(capsule, "EvolvingSystemState")
+    if state_ptr is not NULL:
+        cleanup_system(state_ptr)
+
+def initialize_engine(object ohlcv, double dt, int num_particles=1500):
+    """
+    Initializes the C-Core state and returns a safe Python handle (PyCapsule).
+    """
+    cdef np.ndarray[double, ndim=2, mode='c'] data = np.ascontiguousarray(ohlcv, dtype=np.float64)
+    cdef int n = data.shape[0]
     
-    def __cinit__(self, object ohlcv, double dt, int num_particles=1000):
-        cdef np.ndarray[double, ndim=2, mode='c'] data = _sanitize(ohlcv)
+    # Call the C initializer
+    cdef EvolvingSystemState* state_ptr
+    with nogil:
+        state_ptr = initialize_system(&data[0,0], n, dt, num_particles)
         
-        # Allocate C memory for the state struct
-        self.state = <EvolvingSystemState*> malloc(sizeof(EvolvingSystemState))
-        if self.state is NULL:
-            raise MemoryError()
-            
-        # Call C initialization function
-        initialize_system(&data[0,0], data.shape[0], dt, num_particles, self.state)
+    if state_ptr is NULL:
+        raise MemoryError("Failed to initialize C-Core state.")
         
-    def __dealloc__(self):
-        if self.state is not NULL:
-            free(self.state)
-            
-    def update(self, double new_ret, double new_vol):
-        cdef InstantMetrics metrics
+    # Create a PyCapsule to safely manage the pointer in Python
+    # It stores the pointer and a destructor function
+    return PyCapsule_New(state_ptr, "EvolvingSystemState", capsule_cleanup)
+
+def run_engine_step(object capsule, double new_ret, double new_vol):
+    """
+    Takes the Python handle, runs one step in the C-Core, returns metrics.
+    """
+    cdef EvolvingSystemState* state_ptr = <EvolvingSystemState*>PyCapsule_GetPointer(capsule, "EvolvingSystemState")
+    if state_ptr is NULL:
+        raise ValueError("Invalid Engine Handle.")
         
-        # This function MUST be nogil for parallel execution if you had multiple
-        # engines running. For one, it's fine.
-        run_system_step(self.state, new_ret, new_vol, &metrics)
-        
-        return {
-            "ev_ret": metrics.expected_return,
-            "ev_vol": metrics.expected_vol,
-            "escape": metrics.escape_velocity,
-            "entropy": metrics.swarm_entropy
-        }
+    cdef InstantMetrics metrics
+    
+    # Call the C update function
+    with nogil:
+        run_system_step(state_ptr, new_ret, new_vol, &metrics)
+    
+    return {
+        "ev_ret": metrics.expected_return,
+        "ev_vol": metrics.expected_vol,
+        "escape": metrics.escape_velocity,
+        "entropy": metrics.swarm_entropy
+    }
