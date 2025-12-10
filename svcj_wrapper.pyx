@@ -3,40 +3,39 @@
 
 import numpy as np
 cimport numpy as np
-from libc.stdlib cimport malloc, free
 
 cdef extern from "svcj.h":
-    ctypedef struct BreakoutSignal:
-        double ks_stat, p_value, energy_ratio, drift_z_score
-        int is_breakout
-        
-    void run_hierarchical_scan(double* ohlcv, int len_long, int len_short, double dt, int n_particles, BreakoutSignal* out) nogil
+    ctypedef struct FidelityMetrics:
+        double energy_ratio, residue_bias, hurst_exponent
+        double ks_stat, levene_p, jb_p
+        int is_valid
+    
+    void run_fidelity_scan_native(double* ohlcv, int total_len, int w_grav, int w_imp, double dt, FidelityMetrics* out) nogil
 
 cdef np.ndarray[double, ndim=2, mode='c'] _sanitize(object d):
     return np.ascontiguousarray(np.asarray(d, dtype=np.float64))
 
-def scan_hierarchical(object ohlcv, int win_long, int win_short, double dt, int n_particles=500):
-    """
-    Runs the Hierarchical Swarm Analysis (Gravity vs Impulse).
-    """
+def scan_fidelity(object ohlcv, double dt):
     cdef np.ndarray[double, ndim=2, mode='c'] data = _sanitize(ohlcv)
     cdef int n = data.shape[0]
     
-    if n < win_long: win_long = n
-    if win_long < win_short + 10: return None
-        
-    cdef BreakoutSignal s
+    # Needs sufficient history: Grav(150) + Imp(30)
+    if n < 200: return None
     
-    # Pass pointer to START of long window
-    cdef int start_idx = n - win_long
+    cdef FidelityMetrics m
     
     with nogil:
-        run_hierarchical_scan(&data[start_idx, 0], win_long, win_short, dt, n_particles, &s)
+        # Fixed Windows: Gravity 150 (Stable), Impulse 30 (Fast)
+        run_fidelity_scan_native(&data[0,0], n, 150, 30, dt, &m)
         
     return {
-        "ks_stat": s.ks_stat,
-        "p_value": s.p_value,
-        "energy_ratio": s.energy_ratio,
-        "drift": s.drift_z_score,
-        "is_breakout": bool(s.is_breakout)
+        "energy_ratio": m.energy_ratio,
+        "bias": m.residue_bias,
+        "hurst": m.hurst_exponent,
+        "stats": {
+            "ks_stat": m.ks_stat,
+            "levene_p": m.levene_p,
+            "jb_p": m.jb_p
+        },
+        "is_valid": bool(m.is_valid)
     }
