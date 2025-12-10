@@ -3,39 +3,67 @@
 
 import numpy as np
 cimport numpy as np
+from libc.stdlib cimport malloc, free
 
 cdef extern from "svcj.h":
-    ctypedef struct FidelityMetrics:
-        double energy_ratio, residue_bias, hurst_exponent
-        double ks_stat, levene_p, jb_p
-        int is_valid
+    ctypedef struct Particle:
+        double mu, kappa, theta, sigma_v, rho, lambda_j
+        double weight
+    ctypedef struct GravityDistribution:
+        double mean[6], cov[36]
+    ctypedef struct InstantState:
+        double expected_return, expected_vol, mahalanobis_dist, kl_divergence, swarm_entropy
     
-    void run_fidelity_scan_native(double* ohlcv, int total_len, int w_grav, int w_imp, double dt, FidelityMetrics* out) nogil
+    void run_gravity_scan(double* ohlcv, int len, double dt, GravityDistribution* out) nogil
+    void generate_prior_swarm(GravityDistribution* anchor, int n, Particle* out) nogil
+    void run_particle_filter_step(Particle* curr, int n, double r, double v, double av, double dt, GravityDistribution* anchor, Particle* next, InstantState* out) nogil
 
 cdef np.ndarray[double, ndim=2, mode='c'] _sanitize(object d):
     return np.ascontiguousarray(np.asarray(d, dtype=np.float64))
 
-def scan_fidelity(object ohlcv, double dt):
-    cdef np.ndarray[double, ndim=2, mode='c'] data = _sanitize(ohlcv)
-    cdef int n = data.shape[0]
+# The Main Class: Evolving Particle Filter
+cdef class EvolvingFilter:
+    cdef GravityDistribution anchor
+    cdef Particle* swarm
+    cdef int n_particles
+    cdef double dt
+    cdef double avg_vol
     
-    # Needs sufficient history: Grav(150) + Imp(30)
-    if n < 200: return None
-    
-    cdef FidelityMetrics m
-    
-    with nogil:
-        # Fixed Windows: Gravity 150 (Stable), Impulse 30 (Fast)
-        run_fidelity_scan_native(&data[0,0], n, 150, 30, dt, &m)
+    def __init__(self, object ohlcv, double dt, int num_particles=1000):
+        cdef np.ndarray[double, ndim=2, mode='c'] data = _sanitize(ohlcv)
         
-    return {
-        "energy_ratio": m.energy_ratio,
-        "bias": m.residue_bias,
-        "hurst": m.hurst_exponent,
-        "stats": {
-            "ks_stat": m.ks_stat,
-            "levene_p": m.levene_p,
-            "jb_p": m.jb_p
-        },
-        "is_valid": bool(m.is_valid)
-    }
+        # 1. Establish Gravity
+        run_gravity_scan(&data[0,0], data.shape[0], dt, &self.anchor)
+        
+        # 2. Seed the Swarm
+        self.n_particles = num_particles
+        self.dt = dt
+        self.swarm = <Particle*> malloc(num_particles * sizeof(Particle))
+        generate_prior_swarm(&self.anchor, num_particles, self.swarm)
+        
+        # Set initial avg volume
+        self.avg_vol = np.mean(ohlcv[:, 4])
+        
+    def __dealloc__(self):
+        free(self.swarm)
+        
+    def update(self, double new_ret, double new_vol):
+        cdef Particle* next_gen = <Particle*> malloc(self.n_particles * sizeof(Particle))
+        cdef InstantState state
+        
+        run_particle_filter_step(
+            self.swarm, self.n_particles, new_ret, new_vol, self.avg_vol,
+            self.dt, &self.anchor, next_gen, &state
+        )
+        
+        # Swap pointers for next iteration
+        free(self.swarm)
+        self.swarm = next_gen
+        
+        return {
+            "ev_ret": state.expected_return,
+            "ev_vol": state.expected_vol,
+            "escape_dist": state.mahalanobis_dist,
+            "surprise": state.kl_divergence,
+            "entropy": state.swarm_entropy
+        }

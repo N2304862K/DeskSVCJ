@@ -6,36 +6,41 @@
 #include <stdio.h>
 #include <string.h>
 
-#define NM_ITER 300
-#define N_COLS 5
+#define N_COLS 5 // OHLCV
 
+// --- Structures ---
+
+// A single hypothesis about the market's physics
 typedef struct {
-    double mu, kappa, theta, sigma_v, rho, lambda_j, mu_j, sigma_j;
-} SVCJParams;
+    double mu, kappa, theta, sigma_v, rho, lambda_j;
+    double weight; // Fitness score
+} Particle;
 
+// A probabilistic belief (Gaussian) about the market's structure
 typedef struct {
-    double energy_ratio;    // Theta_Impulse / Theta_Gravity
-    double residue_bias;
-    double hurst_exponent;  // On Raw Returns (valid)
-    
-    double ks_stat;
-    double levene_p;
-    double jb_p;
-    
-    int is_valid;
-} FidelityMetrics;
+    double mean[6]; // Mean vector for the 6 core params
+    double cov[36]; // 6x6 Covariance Matrix
+} GravityDistribution;
 
-// Core
+// The output of the live filter
+typedef struct {
+    double expected_return;
+    double expected_vol;
+    double mahalanobis_dist; // Escape Velocity from Gravity
+    double kl_divergence;    // Surprise Index
+    double swarm_entropy;    // Swarm Health
+} InstantState;
+
+// --- Function Prototypes ---
+
+// Utils
 void compute_log_returns(double* ohlcv, int n, double* out_ret, double* out_vol);
 
-// Optimization
-double ukf_volume_likelihood(double* ret, double* vol, int n, double dt, double avg_vol, SVCJParams* p);
-void optimize_svcj(double* ret, double* vol, int n, double dt, SVCJParams* p);
+// Gravity Engine (Low Frequency)
+void run_gravity_scan(double* ohlcv, int total_len, double dt, GravityDistribution* out_anchor);
 
-// Pipeline
-void run_fidelity_scan_native(double* ohlcv, int total_len, int w_grav, int w_imp, double dt, FidelityMetrics* out);
-
-// Helpers
-void sort_doubles_fast(double* arr, int n);
+// Particle Filter (High Frequency)
+void generate_prior_swarm(GravityDistribution* anchor, int n_particles, Particle* out_swarm);
+void run_particle_filter_step(Particle* current_swarm, int n_particles, double new_return, double new_volume, double avg_vol, double dt, GravityDistribution* anchor, Particle* next_swarm, InstantState* out_state);
 
 #endif
