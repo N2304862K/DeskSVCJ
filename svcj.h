@@ -6,41 +6,48 @@
 #include <stdio.h>
 #include <string.h>
 
-#define N_COLS 5 // OHLCV
+#define NM_ITER 200
+#define N_COLS 5
+#define MAX_PARTICLES 2000
 
-// --- Structures ---
-
-// A single hypothesis about the market's physics
 typedef struct {
-    double mu, kappa, theta, sigma_v, rho, lambda_j;
-    double weight; // Fitness score
+    double mu, kappa, theta, sigma_v, rho, lambda_j, mu_j, sigma_j;
+    double weight;
 } Particle;
 
-// A probabilistic belief (Gaussian) about the market's structure
 typedef struct {
-    double mean[6]; // Mean vector for the 6 core params
-    double cov[36]; // 6x6 Covariance Matrix
+    double mean[8];
+    double cov[64];
 } GravityDistribution;
 
-// The output of the live filter
 typedef struct {
     double expected_return;
     double expected_vol;
-    double mahalanobis_dist; // Escape Velocity from Gravity
-    double kl_divergence;    // Surprise Index
-    double swarm_entropy;    // Swarm Health
-} InstantState;
+    double escape_velocity; // Mahalanobis Dist
+    double surprise_index;  // KL Divergence
+    double swarm_entropy;
+} InstantMetrics;
+
+// This struct holds the entire state of the evolving system
+typedef struct {
+    GravityDistribution anchor;
+    Particle swarm[MAX_PARTICLES];
+    int n_particles;
+    double dt;
+    double avg_volume;
+} EvolvingSystemState;
 
 // --- Function Prototypes ---
-
-// Utils
 void compute_log_returns(double* ohlcv, int n, double* out_ret, double* out_vol);
 
-// Gravity Engine (Low Frequency)
-void run_gravity_scan(double* ohlcv, int total_len, double dt, GravityDistribution* out_anchor);
+// Initialization
+void initialize_system(double* ohlcv, int n, double dt, int n_particles, EvolvingSystemState* out_state);
 
-// Particle Filter (High Frequency)
-void generate_prior_swarm(GravityDistribution* anchor, int n_particles, Particle* out_swarm);
-void run_particle_filter_step(Particle* current_swarm, int n_particles, double new_return, double new_volume, double avg_vol, double dt, GravityDistribution* anchor, Particle* next_swarm, InstantState* out_state);
+// The Main Loop
+void run_system_step(EvolvingSystemState* state, double new_return, double new_volume, InstantMetrics* out_metrics);
+
+// Internal Helpers (Not exposed to Cython)
+void optimize_single_window(double* ret, double* vol, int n, double dt, SVCJParams* p);
+void check_constraints(SVCJParams* p);
 
 #endif
