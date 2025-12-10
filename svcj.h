@@ -6,38 +6,42 @@
 #include <stdio.h>
 #include <string.h>
 
-#define NM_ITER 300
 #define N_COLS 5
+#define TICK_BUFFER_SIZE 60 // Buffer for Skew/Jerk stats
+#define NM_ITER 250
 
 typedef struct {
     double mu, kappa, theta, sigma_v, rho, lambda_j, mu_j, sigma_j;
 } SVCJParams;
 
+// The High-Frequency State (Internal)
 typedef struct {
-    // --- PHYSICS PAYLOAD (Exposed to Python) ---
-    // Core Test
-    double max_deviation;
-    double p_value;
-    int is_breakout;
-    
-    // Confirmation Factors
-    double hurst_exponent;
-    double residue_bias;
-    double energy_ratio;
-    
-} CausalStats;
+    double price_buffer[TICK_BUFFER_SIZE];
+    double z_score_buffer[TICK_BUFFER_SIZE];
+    int buffer_idx;
+    int is_full;
+    double state_variance; // The UKF state
+} TickState;
 
-// Core
-void compute_log_returns(double* ohlcv, int n, double* out);
+// The Instantaneous Output
+typedef struct {
+    double z_score;
+    double jerk;
+    double skew;
+    int needs_recalibration; // Model Failure Flag
+} InstantMetrics;
 
-// Optimization
-void optimize_svcj(double* ret, int n, double dt, SVCJParams* p);
+// --- Physics I/O ---
+int save_physics(const char* ticker, SVCJParams* p);
+int load_physics(const char* ticker, SVCJParams* p);
 
-// Main Engine
-void test_causal_cone(double* impulse_prices, int n_impulse, double dt, SVCJParams* gravity, CausalStats* out);
-void fit_gravity_physics(double* ohlcv, int n, double dt, SVCJParams* out_params);
+// --- Core ---
+double ukf_likelihood(double* ret, double* vol, int n, double dt, SVCJParams* p);
+void optimize_svcj_volume(double* ohlcv, int n, double dt, SVCJParams* p);
 
-// Helpers
-double calc_hurst(double* data, int n);
+// --- The Instantaneous Engine ---
+void init_tick_state(TickState* state, SVCJParams* p);
+void run_tick_update(double price, double vol, double dt, SVCJParams* p, TickState* state, InstantMetrics* out);
+void check_model_coherence(TickState* state, InstantMetrics* out); // KS Test
 
 #endif
