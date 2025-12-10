@@ -3,39 +3,68 @@
 
 import numpy as np
 cimport numpy as np
+from libc.stdlib cimport malloc, free
 
 cdef extern from "svcj.h":
-    ctypedef struct FidelityMetrics:
-        double energy_ratio, residue_bias, hurst_exponent
-        double ks_stat, levene_p, jb_p
-        int is_valid
+    ctypedef struct Particle:
+        double kappa, theta, sigma_v, rho, lambda_j
+        double v, weight
     
-    void run_fidelity_scan_native(double* ohlcv, int total_len, int w_grav, int w_imp, double dt, FidelityMetrics* out) nogil
+    ctypedef struct FilterStats:
+        double spot_vol_mean, spot_vol_std, innovation_z
+        double entropy, ess
+        
+    void generate_prior_swarm(double* ohlcv, int n, double dt, Particle* swarm) nogil
+    void run_particle_filter_step(Particle* swarm, double ret, double dt, FilterStats* stats) nogil
 
 cdef np.ndarray[double, ndim=2, mode='c'] _sanitize(object d):
     return np.ascontiguousarray(np.asarray(d, dtype=np.float64))
 
-def scan_fidelity(object ohlcv, double dt):
-    cdef np.ndarray[double, ndim=2, mode='c'] data = _sanitize(ohlcv)
-    cdef int n = data.shape[0]
+# --- The Particle Filter Class ---
+cdef class ParticleFilter:
+    cdef Particle* swarm
+    cdef double dt
+    cdef int swarm_size
     
-    # Needs sufficient history: Grav(150) + Imp(30)
-    if n < 200: return None
-    
-    cdef FidelityMetrics m
-    
-    with nogil:
-        # Fixed Windows: Gravity 150 (Stable), Impulse 30 (Fast)
-        run_fidelity_scan_native(&data[0,0], n, 150, 30, dt, &m)
+    def __cinit__(self, object ohlcv, double dt):
+        """
+        Initializes and Seeds the Swarm.
+        """
+        cdef np.ndarray[double, ndim=2, mode='c'] data = _sanitize(ohlcv)
+        cdef int n = data.shape[0]
+        self.swarm_size = 5000
         
-    return {
-        "energy_ratio": m.energy_ratio,
-        "bias": m.residue_bias,
-        "hurst": m.hurst_exponent,
-        "stats": {
-            "ks_stat": m.ks_stat,
-            "levene_p": m.levene_p,
-            "jb_p": m.jb_p
-        },
-        "is_valid": bool(m.is_valid)
-    }
+        # Allocate C-memory for the swarm
+        self.swarm = <Particle*> malloc(self.swarm_size * sizeof(Particle))
+        if self.swarm is NULL:
+            raise MemoryError()
+            
+        self.dt = dt
+        
+        # Call C-Core to generate the Prior
+        generate_prior_swarm(&data[0,0], n, dt, self.swarm)
+        
+    def __dealloc__(self):
+        """
+        Clean up C-memory when object is garbage collected.
+        """
+        if self.swarm is not NULL:
+            free(self.swarm)
+            
+    def update(self, double price_now, double price_prev):
+        """
+        Runs one step of the filter.
+        """
+        cdef double ret = np.log(price_now / price_prev)
+        cdef FilterStats stats
+        
+        # Run C-Core Step
+        run_particle_filter_step(self.swarm, ret, self.dt, &stats)
+        
+        return {
+            "spot_vol": stats.spot_vol_mean,
+            "vol_uncertainty": stats.spot_vol_std,
+            "z_score": stats.innovation_z,
+            "ess": stats.ess,
+            "entropy": stats.entropy
+        }
