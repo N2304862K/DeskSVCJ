@@ -7,41 +7,37 @@
 #include <string.h>
 
 #define N_COLS 5
-#define TICK_BUFFER_SIZE 60 // Buffer for Skew/Jerk stats
-#define NM_ITER 250
+#define TICK_BUFFER_SIZE 30 // For Skew/Jerk
 
 typedef struct {
     double mu, kappa, theta, sigma_v, rho, lambda_j, mu_j, sigma_j;
 } SVCJParams;
 
-// The High-Frequency State (Internal)
-typedef struct {
-    double price_buffer[TICK_BUFFER_SIZE];
-    double z_score_buffer[TICK_BUFFER_SIZE];
-    int buffer_idx;
-    int is_full;
-    double state_variance; // The UKF state
-} TickState;
-
-// The Instantaneous Output
 typedef struct {
     double z_score;
-    double jerk;
-    double skew;
-    int needs_recalibration; // Model Failure Flag
+    double jerk; // d(Z)/dt
+    double skew; // Skew of recent Z-scores
+    int recalibrate_flag; // 1 = Model Failure
 } InstantMetrics;
 
-// --- Physics I/O ---
-int save_physics(const char* ticker, SVCJParams* p);
+// --- GLOBAL STATE (Internal to C-Core) ---
+// This allows the C-Core to be stateful across calls
+
+// --- FUNCTION PROTOTYPES ---
+
+// File I/O
 int load_physics(const char* ticker, SVCJParams* p);
+void save_physics(const char* ticker, SVCJParams* p);
 
-// --- Core ---
-double ukf_likelihood(double* ret, double* vol, int n, double dt, SVCJParams* p);
-void optimize_svcj_volume(double* ohlcv, int n, double dt, SVCJParams* p);
+// Core
+void compute_log_returns(double* ohlcv, int n_rows, double* out_returns, double* out_volumes);
+void optimize_svcj_core(double* returns, double* volumes, int n, double dt, SVCJParams* p);
 
-// --- The Instantaneous Engine ---
-void init_tick_state(TickState* state, SVCJParams* p);
-void run_tick_update(double price, double vol, double dt, SVCJParams* p, TickState* state, InstantMetrics* out);
-void check_model_coherence(TickState* state, InstantMetrics* out); // KS Test
+// The New Instantaneous Engine
+void initialize_tick_engine(SVCJParams* p, double dt);
+void run_tick_update(double price, double volume, InstantMetrics* out);
+
+// The Calibration Engine (Called only when flagged)
+void run_full_calibration(const char* ticker, double* ohlcv, int n, double dt);
 
 #endif

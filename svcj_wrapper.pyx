@@ -3,79 +3,68 @@
 
 import numpy as np
 cimport numpy as np
-from libc.stdlib cimport malloc, free
-from libc.string cimport strcpy
 
 cdef extern from "svcj.h":
     ctypedef struct SVCJParams:
-        double mu, kappa, theta, sigma_v, rho, lambda_j, mu_j, sigma_j
-    ctypedef struct TickState:
-        pass
+        double mu, kappa, theta, sigma_v, rho, lambda_j
     ctypedef struct InstantMetrics:
         double z_score, jerk, skew
-        int needs_recalibration
+        int recalibrate_flag
     
-    int save_physics(const char* ticker, SVCJParams* p) nogil
     int load_physics(const char* ticker, SVCJParams* p) nogil
-    void optimize_svcj_volume(double* ohlcv, int n, double dt, SVCJParams* p) nogil
-    void init_tick_state(TickState* state, SVCJParams* p) nogil
-    void run_tick_update(double price, double vol, double dt, SVCJParams* p, TickState* state, InstantMetrics* out) nogil
+    void run_full_calibration(const char* ticker, double* ohlcv, int n, double dt) nogil
+    void initialize_tick_engine(SVCJParams* p, double dt) nogil
+    void run_tick_update(double price, double volume, InstantMetrics* out) nogil
 
 cdef np.ndarray[double, ndim=2, mode='c'] _sanitize(object d):
     return np.ascontiguousarray(np.asarray(d, dtype=np.float64))
 
-# --- The Self-Organizing Engine ---
-cdef class TickEngine:
-    cdef SVCJParams params
-    cdef TickState state
+# The Main Interface
+cdef class InstantMonitor:
+    cdef str ticker
     cdef double dt
-    cdef char ticker[256]
+    cdef bint is_ready
     
-    def __init__(self, str ticker_str, object initial_ohlcv, double dt):
+    def __init__(self, str ticker, double dt):
+        self.ticker = ticker
         self.dt = dt
+        self.is_ready = False
         
-        # Convert Python string to C char*
-        cdef bytes ticker_bytes = ticker_str.encode('UTF-8')
-        strcpy(self.ticker, ticker_bytes)
+        cdef SVCJParams p
+        cdef bytes ticker_bytes = ticker.encode('utf-8')
         
-        # Try to load physics, if fail, calibrate.
-        if not load_physics(self.ticker, &self.params):
-            print(f"[{ticker_str}] No saved physics found. Calibrating...")
-            self.recalibrate(initial_ohlcv)
+        # Try to load physics from file
+        if load_physics(ticker_bytes, &p):
+            initialize_tick_engine(&p, dt)
+            self.is_ready = True
+            print(f"[{ticker}] Physics loaded from disk. Monitor ready.")
         else:
-            print(f"[{ticker_str}] Loaded physics from cache.")
+            print(f"[{ticker}] No physics file found. CALIBRATION REQUIRED.")
             
-        init_tick_state(&self.state, &self.params)
-
-    def recalibrate(self, object ohlcv):
+    def calibrate(self, object ohlcv):
+        """
+        Runs the heavy calibration and saves the model to disk.
+        """
         cdef np.ndarray[double, ndim=2, mode='c'] data = _sanitize(ohlcv)
         cdef int n = data.shape[0]
+        cdef bytes ticker_bytes = self.ticker.encode('utf-8')
         
-        # Heavy compute, release GIL
-        with nogil:
-            optimize_svcj_volume(&data[0,0], n, self.dt, &self.params)
-            save_physics(self.ticker, &self.params)
-            
-        print(f"   > Recalibrated & saved. Theta={self.params.theta:.4f}")
-        init_tick_state(&self.state, &self.params) # Reset buffers
-
-    def update(self, double price, double vol, object ohlcv_hist=None):
+        run_full_calibration(ticker_bytes, &data[0,0], n, self.dt)
+        self.is_ready = True
+        print(f"[{self.ticker}] Calibration complete. Physics saved.")
+        
+    def update(self, double price, double volume):
+        """
+        High-speed update. Returns Jerk & Skew.
+        """
+        if not self.is_ready: return None
+        
         cdef InstantMetrics m
+        run_tick_update(price, volume, &m)
         
-        run_tick_update(price, vol, self.dt, &self.params, &self.state, &m)
-        
-        # Internal failure detection
-        if m.needs_recalibration == 1:
-            print(f"   >>> MODEL COHERENCE FAILURE (KS Test). Triggering recalibration.")
-            if ohlcv_hist is not None:
-                self.recalibrate(ohlcv_hist)
-            # After recalibration, the *next* tick will be valid.
-            # Return a 'safe' state for this tick.
-            return {"z_score": 0, "jerk": 0, "skew": 0, "recalibrated": True}
-
         return {
-            "z_score": m.z_score,
+            "z": m.z_score,
             "jerk": m.jerk,
             "skew": m.skew,
-            "recalibrated": False
+            "recalibrate": bool(m.recalibrate_flag)
         }
