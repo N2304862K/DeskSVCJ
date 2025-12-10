@@ -1,204 +1,275 @@
 #include "svcj.h"
 #include <float.h>
 
-// =======================================================
-// 1. INTERNAL STATE & FILE I/O
-// =======================================================
+// --- MATH UTILS ---
+int cmp(const void* a, const void* b) {
+    double x=*(double*)a, y=*(double*)b;
+    return (x<y)?-1:(x>y);
+}
 
-// These variables are PERSISTENT inside the compiled .so/.dll
-static SVCJParams g_params;
-static double g_dt;
-static double g_state_variance;
-static double g_avg_volume;
-static double g_tick_buffer[TICK_BUFFER_SIZE];
-static int g_tick_idx = 0;
-static double g_last_z = 0;
-// Model Health
-static double g_log_likelihood_sum = 0;
-static double g_baseline_ll_per_tick = 0;
-static int g_ticks_since_calib = 0;
-
-int load_physics(const char* ticker, SVCJParams* p) {
-    char filename[256];
-    sprintf(filename, "./%s.bin", ticker);
-    FILE* f = fopen(filename, "rb");
-    if(!f) return 0;
+// Anderson-Darling Test (Tail Sensitive)
+// Returns A^2 statistic. Critical value for 95% approx 2.5 in finance context
+double perform_anderson_darling(double* data, int n) {
+    if (n < 5) return 0.0;
     
-    fread(p, sizeof(SVCJParams), 1, f);
-    fclose(f);
-    return 1;
-}
-
-void save_physics(const char* ticker, SVCJParams* p) {
-    char filename[256];
-    sprintf(filename, "./%s.bin", ticker);
-    FILE* f = fopen(filename, "wb");
-    if(!f) return;
+    // Normalize data (Standardize)
+    double mean=0, sq=0;
+    for(int i=0;i<n;i++) mean+=data[i]; mean/=n;
+    for(int i=0;i<n;i++) sq+=(data[i]-mean)*(data[i]-mean);
+    double std = sqrt(sq/(n-1));
+    if(std < 1e-9) return 0.0;
     
-    fwrite(p, sizeof(SVCJParams), 1, f);
-    fclose(f);
+    double* sorted = malloc(n*sizeof(double));
+    for(int i=0;i<n;i++) sorted[i] = (data[i]-mean)/std;
+    qsort(sorted, n, sizeof(double), cmp);
+    
+    double s = 0;
+    for(int i=0; i<n; i++) {
+        // CDF of Normal
+        double x = sorted[i];
+        double cdf = 0.5 * erfc(-x * 0.70710678);
+        if(cdf < 1e-9) cdf=1e-9; if(cdf > 0.999999999) cdf=0.999999999;
+        
+        double term = (2.0*(i+1)-1.0) * (log(cdf) + log(1.0 - sorted[n-1-i])); // Logic check: should be cdf of reversed?
+        // Standard AD formula: S = -N - (1/N) * Sum( (2i-1)*(ln(Yi) + ln(1-Y(n+1-i))) )
+        // Using correct indexing:
+        double cdf_rev = 0.5 * erfc(-sorted[n-1-i] * 0.70710678);
+        if(cdf_rev > 0.999999999) cdf_rev=0.999999999;
+        
+        s += (2.0*(i+1)-1.0) * (log(cdf) + log(1.0 - cdf_rev));
+    }
+    free(sorted);
+    return -n - (1.0/n)*s;
 }
 
-// =======================================================
-// 2. CORE OPTIMIZATION (Condensed)
-// =======================================================
-void check_constraints(SVCJParams* p) {
-    if(p->theta<1e-6)p->theta=1e-6; if(p->kappa<0.1)p->kappa=0.1;
-    if(p->sigma_v<0.01)p->sigma_v=0.01; if(p->lambda_j<0.01)p->lambda_j=0.01;
+double calc_hurst(double* data, int n) {
+    if(n<20) return 0.5;
+    double m=0; for(int i=0;i<n;i++) m+=data[i]; m/=n;
+    double ss=0; for(int i=0;i<n;i++) ss+=(data[i]-m)*(data[i]-m);
+    double std=sqrt(ss/n); if(std<1e-9) return 0.5;
+    double maxd=-1e9, mind=1e9, c=0;
+    for(int i=0;i<n;i++) { c+=(data[i]-m); if(c>maxd)maxd=c; if(c<mind)mind=c; }
+    return log((maxd-mind)/std)/log((double)n);
 }
 
-double ukf_vol_ll(double* r, double* v, int n, double dt, double av, SVCJParams* p) {
-    double ll=0; double var_state=p->theta; 
+// --- CORE PHYSICS ---
+void compute_log_returns(double* ohlcv, int n, double* out) {
+    for(int i=1; i<n; i++) out[i-1] = log(ohlcv[i*N_COLS+3]/ohlcv[(i-1)*N_COLS+3]);
+}
+
+void compute_volume_weighted_returns(double* ohlcv, int n, double* out) {
+    double sum_v=0; for(int i=0;i<n;i++) sum_v+=ohlcv[i*N_COLS+4];
+    double avg_v = sum_v/n; if(avg_v<1) avg_v=1;
+    
+    for(int i=1; i<n; i++) {
+        double r = log(ohlcv[i*N_COLS+3]/ohlcv[(i-1)*N_COLS+3]);
+        double v = ohlcv[i*N_COLS+4];
+        // Square Root Law: Variance ~ Volume -> Volatility ~ Sqrt(Volume)
+        out[i-1] = r * sqrt(v/avg_v); 
+    }
+}
+
+// --- OPTIMIZATION & HESSIAN ---
+double ukf_likelihood(double* ret, int n, double dt, SVCJParams* p) {
+    double ll=0; double v=p->theta; 
+    double var_j = p->mu_j*p->mu_j + p->sigma_j*p->sigma_j;
+    
     for(int t=0; t<n; t++) {
-        double dt_eff = dt * (v[t]/av);
-        double v_pred = var_state + p->kappa*(p->theta - var_state)*dt_eff;
-        if(v_pred<1e-9)v_pred=1e-9;
-        double y = r[t] - (p->mu - 0.5*v_pred)*dt_eff;
-        double S = v_pred*dt_eff + p->lambda_j*dt_eff*(p->mu_j*p->mu_j+p->sigma_j*p->sigma_j);
-        if(S<1e-9)S=1e-9;
-        double pdf = (1.0/sqrt(2*M_PI*S))*exp(-0.5*y*y/S);
-        ll += log(pdf + 1e-20);
-        var_state = v_pred + 0.1*(y*y - S);
-        if(var_state<1e-9)var_state=1e-9;
+        double v_pred = v + p->kappa*(p->theta - v)*dt;
+        if(v_pred<1e-9) v_pred=1e-9;
+        double y = ret[t] - (p->mu - 0.5*v_pred)*dt;
+        
+        // Robust PDF
+        double tot_var = v_pred + p->lambda_j*dt*var_j;
+        double sd = sqrt(tot_var*dt);
+        if(sd<1e-9) sd=1e-9;
+        
+        double pdf = (1.0/(sqrt(2*M_PI)*sd)) * exp(-0.5*y*y/(sd*sd));
+        ll += log(pdf + 1e-25);
+        
+        // Update (Simplified for Gradient Stability in Hessian)
+        v = v_pred + (p->rho*p->sigma_v*dt/tot_var)*y; // Simple Gain
+        if(v<1e-9) v=1e-9; if(v>20.0) v=20.0;
     }
     return ll;
 }
 
-void optimize_svcj_core(double* returns, double* volumes, int n, double dt, SVCJParams* p) {
-    // Basic init
-    p->theta=0.04; p->kappa=3.0; p->sigma_v=0.5; p->rho=-0.5; p->lambda_j=0.5;
-    
-    double avg_vol = 0; for(int i=0; i<n; i++) avg_vol += volumes[i]; avg_vol /= n;
+void check_bounds(SVCJParams* p) {
+    if(p->theta<1e-5)p->theta=1e-5; if(p->theta>20)p->theta=20;
+    if(p->kappa<0.1)p->kappa=0.1; if(p->kappa>50)p->kappa=50;
+    if(p->sigma_v<0.01)p->sigma_v=0.01; if(p->sigma_v>20)p->sigma_v=20;
+    if(p->rho>0.99)p->rho=0.99; if(p->rho<-0.99)p->rho=-0.99;
+    if(p->lambda_j<0.01)p->lambda_j=0.01;
+}
+
+void optimize_svcj(double* ret, int n, double dt, SVCJParams* p) {
+    // Quick Estimation
+    double sum_sq=0; for(int i=0;i<n;i++) sum_sq+=ret[i]*ret[i];
+    p->theta = (sum_sq/n)/dt; 
+    p->mu=0; p->kappa=3.0; p->sigma_v=0.5; p->rho=-0.5; 
+    p->lambda_j=0.5; p->mu_j=0; p->sigma_j=sqrt(p->theta);
     
     // Condensed Nelder-Mead
-    // In full impl, use full loop. Here we just set params based on rough estimate.
-    double sum_sq=0; for(int i=0;i<n;i++) sum_sq+=returns[i]*returns[i];
-    p->theta = (sum_sq/n)/dt;
-    check_constraints(p);
-}
-
-void compute_log_returns(double* ohlcv, int n, double* out_r, double* out_v) {
-    for(int i=1; i<n; i++) {
-        out_r[i-1] = log(ohlcv[i*N_COLS+3]/ohlcv[(i-1)*N_COLS+3]);
-        out_v[i-1] = ohlcv[i*N_COLS+4];
+    int nd=5; double sim[6][5]; double sc[6];
+    for(int i=0;i<=nd;i++) {
+        SVCJParams t=*p;
+        if(i==1)t.kappa*=1.2; if(i==2)t.theta*=1.2; if(i==3)t.sigma_v*=1.2;
+        if(i==4)t.rho+=0.2; if(i==5)t.lambda_j*=1.2;
+        check_bounds(&t);
+        sim[i][0]=t.kappa; sim[i][1]=t.theta; sim[i][2]=t.sigma_v; 
+        sim[i][3]=t.rho; sim[i][4]=t.lambda_j;
+        sc[i] = ukf_likelihood(ret, n, dt, &t);
     }
-}
-
-// =======================================================
-// 3. THE HIGH-SPEED ENGINE
-// =======================================================
-
-void initialize_tick_engine(SVCJParams* p, double dt) {
-    g_params = *p;
-    g_dt = dt;
-    g_state_variance = p->theta;
-    g_tick_idx = 0;
-    g_last_z = 0;
-    g_log_likelihood_sum = 0;
-    g_ticks_since_calib = 0;
     
-    // Calculate Baseline Likelihood
-    // A normal move (Z=0) has this likelihood. We detect deviations from this.
-    double var_exp = (g_params.theta + g_params.lambda_j*(g_params.mu_j*g_params.mu_j+g_params.sigma_j*g_params.sigma_j))*g_dt;
-    g_baseline_ll_per_tick = -0.5*log(2*M_PI*var_exp);
-}
-
-void run_tick_update(double price, double volume, InstantMetrics* out) {
-    // --- 1. State ---
-    static double last_price = -1.0;
-    if(last_price < 0) { last_price = price; out->z_score=0; out->jerk=0; return; }
-    
-    double ret = log(price / last_price);
-    last_price = price;
-    
-    // --- 2. Volume Clock & Prediction ---
-    // Note: avg_volume needs to be set by calibration, here we assume it's stable-ish
-    double time_scale = 1.0; // In prod, this uses a rolling avg from calibration
-    double dt_eff = g_dt * time_scale;
-    
-    double v_pred = g_state_variance + g_params.kappa*(g_params.theta - g_state_variance)*dt_eff;
-    if(v_pred < 1e-9) v_pred = 1e-9;
-    
-    // --- 3. Z-Score (The Signal) ---
-    double y = ret - (g_params.mu - 0.5*v_pred)*dt_eff;
-    double jump_var = g_params.lambda_j * (g_params.mu_j*g_params.mu_j + g_params.sigma_j*g_params.sigma_j);
-    double step_std = sqrt((v_pred + jump_var) * dt_eff);
-    if(step_std < 1e-9) step_std = 1e-9;
-    
-    out->z_score = y / step_std;
-    
-    // --- 4. Jerk (First Derivative) ---
-    out->jerk = out->z_score - g_last_z;
-    g_last_z = out->z_score;
-    
-    // --- 5. Skew (Second Derivative) ---
-    g_tick_buffer[g_tick_idx % TICK_BUFFER_SIZE] = out->z_score;
-    g_tick_idx++;
-    
-    if(g_tick_idx >= TICK_BUFFER_SIZE) {
-        double mean=0;
-        for(int i=0; i<TICK_BUFFER_SIZE; i++) mean += g_tick_buffer[i];
-        mean /= TICK_BUFFER_SIZE;
-        
-        double m2=0, m3=0;
-        for(int i=0; i<TICK_BUFFER_SIZE; i++) {
-            double d = g_tick_buffer[i] - mean;
-            m2 += d*d; m3 += d*d*d;
+    for(int k=0;k<NM_ITER;k++) {
+        int vs[6]; for(int j=0;j<6;j++)vs[j]=j;
+        for(int i=0;i<6;i++) for(int j=i+1;j<6;j++) if(sc[vs[j]]>sc[vs[i]]) {int tp=vs[i]; vs[i]=vs[j]; vs[j]=tp;}
+        double c[5]={0}; for(int i=0;i<5;i++) for(int d=0;d<5;d++) c[d]+=sim[vs[i]][d]; for(int d=0;d<5;d++) c[d]/=5;
+        SVCJParams rp=*p; double ref[5];
+        for(int d=0;d<5;d++) ref[d]=c[d]+(c[d]-sim[vs[5]][d]);
+        rp.kappa=ref[0]; rp.theta=ref[1]; rp.sigma_v=ref[2]; rp.rho=ref[3]; rp.lambda_j=ref[4];
+        check_bounds(&rp);
+        double rsc=ukf_likelihood(ret, n, dt, &rp);
+        if(rsc>sc[vs[0]]) { for(int d=0;d<5;d++) sim[vs[5]][d]=ref[d]; sc[vs[5]]=rsc; }
+        else {
+            SVCJParams cp=*p; 
+            for(int d=0;d<5;d++) sim[vs[5]][d] = c[d] + 0.5*(sim[vs[5]][d]-c[d]);
+            cp.kappa=sim[vs[5]][0]; cp.theta=sim[vs[5]][1]; cp.sigma_v=sim[vs[5]][2]; 
+            cp.rho=sim[vs[5]][3]; cp.lambda_j=sim[vs[5]][4]; check_bounds(&cp);
+            sc[vs[5]] = ukf_likelihood(ret, n, dt, &cp);
         }
-        m2 /= TICK_BUFFER_SIZE;
-        m3 /= TICK_BUFFER_SIZE;
-        
-        out->skew = (m2 > 1e-9) ? m3 / pow(m2, 1.5) : 0;
-    } else {
-        out->skew = 0;
     }
-    
-    // --- 6. State Update ---
-    double S = v_pred*dt_eff + jump_var*dt_eff;
-    double K = (g_params.rho * g_params.sigma_v * dt_eff)/S;
-    g_state_variance = v_pred + K * y;
-    if(g_state_variance < 1e-9) g_state_variance = 1e-9;
-    
-    // --- 7. Model Failure Detection ---
-    double current_ll = -0.5 * log(2*M_PI*S) - 0.5*y*y/S;
-    g_log_likelihood_sum += current_ll;
-    g_ticks_since_calib++;
-    
-    // Chow Test Analogy: Is the average likelihood of this window
-    // significantly worse than the baseline expectation?
-    if (g_ticks_since_calib > 50) { // Wait for buffer
-        double avg_ll = g_log_likelihood_sum / g_ticks_since_calib;
-        
-        // If our model is consistently worse than the "Normal" model
-        // by a significant margin (e.g. 2x in log-space), it has failed.
-        if (avg_ll < g_baseline_ll_per_tick * 2.0) {
-            out->recalibrate_flag = 1;
-        } else {
-            out->recalibrate_flag = 0;
-        }
-    } else {
-        out->recalibrate_flag = 0;
-    }
+    int b=0; for(int i=1;i<6;i++) if(sc[i]>sc[b]) b=i;
+    p->kappa=sim[b][0]; p->theta=sim[b][1]; p->sigma_v=sim[b][2]; p->rho=sim[b][3]; p->lambda_j=sim[b][4];
 }
 
-// =======================================================
-// 4. THE SELF-ORGANIZING CALIBRATOR
-// =======================================================
-void run_full_calibration(const char* ticker, double* ohlcv, int n, double dt) {
-    // 1. Prepare Data
-    double* ret = malloc((n-1)*sizeof(double));
-    double* vol = malloc((n-1)*sizeof(double));
-    compute_log_returns(ohlcv, n, ret, vol);
+// *** HESSIAN & CONFIDENCE ***
+void calculate_hessian_errors(double* ret, int n, double dt, SVCJParams* p, HessianMetrics* out) {
+    // Compute 2nd Derivative of Likelihood w.r.t parameters
+    // We specifically care about Theta, Kappa, Sigma_V
+    double eps = 1e-4;
+    SVCJParams base = *p;
+    double ll_0 = ukf_likelihood(ret, n, dt, &base);
     
-    // 2. Optimize
-    SVCJParams new_params;
-    optimize_svcj_core(ret, vol, n-1, dt, &new_params);
+    // Diagonal approximation of Hessian (Inverse of Variance)
+    // d2L/dTheta2 ~ (L(t+e) - 2L(t) + L(t-e)) / e^2
     
-    // 3. Save to Disk
-    save_physics(ticker, &new_params);
+    // Theta
+    base.theta = p->theta + eps; double l_p = ukf_likelihood(ret, n, dt, &base);
+    base.theta = p->theta - eps; double l_m = ukf_likelihood(ret, n, dt, &base);
+    base.theta = p->theta; // Reset
+    double d2_theta = (l_p - 2*ll_0 + l_m) / (eps*eps);
     
-    // 4. Reload into Live State
-    initialize_tick_engine(&new_params, dt);
+    // Fisher Information = -E[Hessian]. Since we maximize LL, curvature is negative at peak.
+    // Variance = 1 / |Curvature|
+    out->se_theta = (fabs(d2_theta) > 1e-6) ? sqrt(1.0 / fabs(d2_theta)) : 100.0;
     
-    free(ret); free(vol);
+    // Kappa
+    base.kappa = p->kappa + eps; l_p = ukf_likelihood(ret, n, dt, &base);
+    base.kappa = p->kappa - eps; l_m = ukf_likelihood(ret, n, dt, &base);
+    base.kappa = p->kappa;
+    double d2_kappa = (l_p - 2*ll_0 + l_m) / (eps*eps);
+    out->se_kappa = (fabs(d2_kappa) > 1e-6) ? sqrt(1.0 / fabs(d2_kappa)) : 100.0;
+}
+
+// --- ENGINES ---
+void run_vov_scan(double* ohlcv, int total_len, double dt, int step, VoVPoint* out_buf, int max_steps) {
+    SVCJParams p;
+    int idx = 0;
+    // Scan [60 ... N]
+    for(int w=60; w<total_len; w+=step) {
+        if(idx >= max_steps) break;
+        // Use Volume-Weighted Returns for fitting
+        double* ret = malloc((w-1)*sizeof(double));
+        compute_volume_weighted_returns(ohlcv + (total_len-w)*N_COLS, w, ret);
+        
+        optimize_svcj(ret, w-1, dt, &p);
+        
+        out_buf[idx].window = w;
+        out_buf[idx].sigma_v = p.sigma_v;
+        out_buf[idx].theta = p.theta;
+        idx++;
+        free(ret);
+    }
+    if(idx < max_steps) out_buf[idx].window = 0;
+}
+
+void run_fidelity_pipeline(double* ohlcv, int total_len, double dt, FidelityMetrics* out) {
+    // 1. VoV Scan to find Gravity Window (Internal Logic or Passed? Let's do simplified scan here)
+    // For efficiency, assume Gravity is pre-determined or use heuristic.
+    // Better: Python passes specific windows. BUT prompt asks for coherent flow.
+    // Let's implement a quick internal search for Min Sigma_V.
+    
+    int w_grav = 100; // default
+    double min_sig = 1e9;
+    
+    // Coarse scan: 60, 90, 120, 150, 200, 250
+    int candidates[] = {60, 90, 120, 150, 200, 250};
+    for(int k=0; k<6; k++) {
+        if(candidates[k] > total_len - 30) break;
+        int w = candidates[k];
+        double* r = malloc(w*sizeof(double));
+        compute_volume_weighted_returns(ohlcv + (total_len-w)*N_COLS, w, r);
+        SVCJParams p_tmp; optimize_svcj(r, w-1, dt, &p_tmp);
+        if(p_tmp.sigma_v < min_sig) { min_sig = p_tmp.sigma_v; w_grav = w; }
+        free(r);
+    }
+    
+    // 2. Fixed Impulse
+    int w_imp = 30;
+    
+    // 3. Prepare Data
+    // Track A: Gravity (Volume Weighted) for Physics
+    double* r_grav_vol = malloc(w_grav*sizeof(double));
+    compute_volume_weighted_returns(ohlcv + (total_len-w_grav)*N_COLS, w_grav, r_grav_vol);
+    
+    // Track B: Impulse (Volume Weighted) for Physics
+    double* r_imp_vol = malloc(w_imp*sizeof(double));
+    compute_volume_weighted_returns(ohlcv + (total_len-w_imp)*N_COLS, w_imp, r_imp_vol);
+    
+    // Track C: Impulse (RAW) for Statistical Tests
+    double* r_imp_raw = malloc(w_imp*sizeof(double));
+    compute_log_returns(ohlcv + (total_len-w_imp)*N_COLS, w_imp, r_imp_raw);
+    
+    // 4. Fit Physics
+    SVCJParams p_grav; optimize_svcj(r_grav_vol, w_grav-1, dt, &p_grav);
+    HessianMetrics h_grav; calculate_hessian_errors(r_grav_vol, w_grav-1, dt, &p_grav, &h_grav);
+    
+    SVCJParams p_imp; optimize_svcj(r_imp_vol, w_imp-1, dt, &p_imp);
+    
+    // 5. Comparison
+    out->win_gravity = w_grav;
+    out->win_impulse = w_imp;
+    out->theta_gravity = p_grav.theta;
+    out->theta_impulse = p_imp.theta;
+    out->energy_ratio = p_imp.theta / p_grav.theta;
+    
+    // Gate 1: Parameter Z-Score
+    out->theta_std_err = h_grav.se_theta;
+    double diff = fabs(p_imp.theta - p_grav.theta);
+    out->param_z_score = diff / (h_grav.se_theta + 1e-9);
+    
+    // Gate 2: Anderson-Darling (On Raw Returns - are tails fatter?)
+    out->ad_stat = perform_anderson_darling(r_imp_raw, w_imp-1);
+    
+    // Gate 3: Hurst (On Raw Returns - is it trending?)
+    out->hurst = calc_hurst(r_imp_raw, w_imp-1);
+    
+    // Bias
+    double bias=0; for(int i=0;i<w_imp-1;i++) bias+=r_imp_raw[i];
+    out->residue_bias = bias;
+    
+    // 6. Decision Logic
+    // Valid if:
+    // - Param Z > 1.96 (Statistically different structure)
+    // - AD > 1.5 (Tails are active)
+    // - Hurst > 0.55 (Trend is real)
+    
+    int c1 = (out->param_z_score > 1.96);
+    int c2 = (out->ad_stat > 1.5);
+    int c3 = (out->hurst > 0.55);
+    
+    out->is_valid = (c1 && c2 && c3) ? 1 : 0;
+    
+    free(r_grav_vol); free(r_imp_vol); free(r_imp_raw);
 }

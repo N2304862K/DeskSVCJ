@@ -6,38 +6,59 @@
 #include <stdio.h>
 #include <string.h>
 
+#define NM_ITER 400
+#define SQRT_2PI 2.50662827463
 #define N_COLS 5
-#define TICK_BUFFER_SIZE 30 // For Skew/Jerk
 
 typedef struct {
     double mu, kappa, theta, sigma_v, rho, lambda_j, mu_j, sigma_j;
 } SVCJParams;
 
 typedef struct {
-    double z_score;
-    double jerk; // d(Z)/dt
-    double skew; // Skew of recent Z-scores
-    int recalibrate_flag; // 1 = Model Failure
-} InstantMetrics;
+    double se_theta;    // Standard Error of Theta
+    double se_kappa;
+    double se_sigma_v;
+} HessianMetrics;
 
-// --- GLOBAL STATE (Internal to C-Core) ---
-// This allows the C-Core to be stateful across calls
+typedef struct {
+    // Windows
+    int win_gravity;
+    int win_impulse;
+    
+    // Physics
+    double theta_gravity;
+    double theta_impulse;
+    double energy_ratio;
+    
+    // Confidence
+    double theta_std_err; // From Hessian
+    double param_z_score; // |Theta_diff| / SE
+    
+    // Non-Parametric Stats
+    double ad_stat;       // Anderson-Darling
+    double hurst;
+    double residue_bias;
+    
+    // Decision
+    int is_valid;
+} FidelityMetrics;
 
-// --- FUNCTION PROTOTYPES ---
-
-// File I/O
-int load_physics(const char* ticker, SVCJParams* p);
-void save_physics(const char* ticker, SVCJParams* p);
+typedef struct {
+    int window;
+    double sigma_v;
+} VoVPoint;
 
 // Core
-void compute_log_returns(double* ohlcv, int n_rows, double* out_returns, double* out_volumes);
-void optimize_svcj_core(double* returns, double* volumes, int n, double dt, SVCJParams* p);
+void compute_log_returns(double* ohlcv, int n, double* out_ret);
+void compute_volume_weighted_returns(double* ohlcv, int n, double* out_ret);
 
-// The New Instantaneous Engine
-void initialize_tick_engine(SVCJParams* p, double dt);
-void run_tick_update(double price, double volume, InstantMetrics* out);
+// Optimization & Hessian
+double ukf_likelihood(double* ret, int n, double dt, SVCJParams* p);
+void optimize_svcj(double* ret, int n, double dt, SVCJParams* p);
+void calculate_hessian_errors(double* ret, int n, double dt, SVCJParams* p, HessianMetrics* out);
 
-// The Calibration Engine (Called only when flagged)
-void run_full_calibration(const char* ticker, double* ohlcv, int n, double dt);
+// Engines
+void run_vov_scan(double* ohlcv, int total_len, double dt, int step, VoVPoint* out_buf, int max_steps);
+void run_fidelity_pipeline(double* ohlcv, int total_len, double dt, FidelityMetrics* out);
 
 #endif
