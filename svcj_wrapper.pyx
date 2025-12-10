@@ -3,75 +3,42 @@
 
 import numpy as np
 cimport numpy as np
-from libc.stdlib cimport malloc, free
 
 cdef extern from "svcj.h":
-    ctypedef struct SVCJParams:
-        double mu, kappa, theta, sigma_v, rho, lambda_j, mu_j, sigma_j
-    ctypedef struct InstantMetrics:
-        double z_score, jerk, skew
-        int recalibrate_flag
+    ctypedef struct FidelityMetrics:
+        int win_gravity, win_impulse, is_valid
+        double theta_gravity, theta_impulse, energy_ratio
+        double theta_std_err, param_z_score
+        double ad_stat, hurst, residue_bias
     
-    int load_physics(const char* ticker, SVCJParams* p) nogil
-    void run_full_calibration(const char* ticker, double* ohlcv, int n, double dt) nogil
-    void initialize_tick_engine(SVCJParams* p, double dt) nogil
-    void run_tick_update(double price, double volume, InstantMetrics* out) nogil
+    void run_fidelity_pipeline(double* ohlcv, int total_len, double dt, FidelityMetrics* out) nogil
 
 cdef np.ndarray[double, ndim=2, mode='c'] _sanitize(object d):
     return np.ascontiguousarray(np.asarray(d, dtype=np.float64))
 
-# --- The Self-Contained Engine Class ---
-cdef class TickEngine:
-    cdef str ticker
-    cdef double dt
-    cdef bint is_ready
+def scan_fidelity(object ohlcv, double dt):
+    cdef np.ndarray[double, ndim=2, mode='c'] data = _sanitize(ohlcv)
+    cdef int n = data.shape[0]
     
-    def __init__(self, str ticker, object historical_ohlcv, double dt):
-        self.ticker = ticker
-        self.dt = dt
-        self.is_ready = False
+    if n < 200: return None # Need buffer for gravity scan
+    
+    cdef FidelityMetrics m
+    with nogil:
+        run_fidelity_pipeline(&data[0,0], n, dt, &m)
         
-        cdef SVCJParams p
-        cdef bytes ticker_bytes = ticker.encode('utf-8')
-        
-        # 1. Attempt to load pre-calibrated model
-        if load_physics(ticker_bytes, &p):
-            initialize_tick_engine(&p, dt)
-            self.is_ready = True
-            print(f"[{ticker}] Physics loaded from disk. Monitor ready.")
-        else:
-            # 2. If no model exists, calibrate now
-            print(f"[{ticker}] No physics file. Calibrating with provided history...")
-            cdef np.ndarray[double, ndim=2, mode='c'] data = _sanitize(historical_ohlcv)
-            cdef int n = data.shape[0]
-            
-            run_full_calibration(ticker_bytes, &data[0,0], n, self.dt)
-            self.is_ready = True
-            print(f"[{ticker}] Calibration complete. Physics saved to {ticker}.bin.")
-            
-    def update(self, double price, double volume):
-        """
-        High-speed update. Returns Jerk & Skew.
-        """
-        if not self.is_ready: return None
-        
-        cdef InstantMetrics m
-        run_tick_update(price, volume, &m)
-        
-        return {
-            "z": m.z_score,
-            "jerk": m.jerk,
-            "skew": m.skew,
-            "recalibrate_flag": bool(m.recalibrate_flag)
-        }
-        
-    def force_recalibrate(self, object ohlcv):
-        """
-        Public method to trigger recalibration if model fails.
-        """
-        cdef np.ndarray[double, ndim=2, mode='c'] data = _sanitize(ohlcv)
-        cdef int n = data.shape[0]
-        cdef bytes ticker_bytes = self.ticker.encode('utf-8')
-        
-        run_full_calibration(ticker_bytes, &data[0,0], n, self.dt)
-        print(f"[{self.ticker}] Recalibration forced. New physics saved.")
+    return {
+        "windows": (m.win_impulse, m.win_gravity),
+        "physics": {
+            "theta_grav": m.theta_gravity,
+            "theta_imp": m.theta_impulse,
+            "energy_ratio": m.energy_ratio
+        },
+        "stats": {
+            "param_se": m.theta_std_err,
+            "param_z": m.param_z_score,
+            "ad_stat": m.ad_stat,
+            "hurst": m.hurst
+        },
+        "residue_bias": m.residue_bias,
+        "is_valid": bool(m.is_valid)
+    }
