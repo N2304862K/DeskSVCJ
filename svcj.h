@@ -7,23 +7,27 @@
 #include <string.h>
 #include <stdint.h>
 
-#define N_PARTICLES 2000
-#define MIN_EFFECTIVE_PARTICLES 1000
-#define ADAPTIVE_LEARNING_RATE 20.0 // Aggressiveness of Drift Learning
+#define N_PARTICLES 3000 // Increased for 3 sub-swarms
+#define MIN_EFFECTIVE_PARTICLES 1500
 
 typedef struct {
     double v;           // Variance
-    double mu;          // Drift (Velocity)
+    double mu;          // Drift
     double rho;         // Correlation
     double weight;      // Probability
     double last_log_p;  // Memory
+    int regime;         // 1=Bull, -1=Bear, 0=Neutral
 } Particle;
 
 typedef struct {
-    double ev_vol;
     double mode_vol;
-    double ev_drift;
     double entropy;
+    
+    // Regime Probabilities (The Clean Signal)
+    double prob_bull;
+    double prob_bear;
+    double prob_neutral;
+    
     int collapsed;
 } SwarmState;
 
@@ -37,9 +41,9 @@ typedef struct {
 } PhysicsParams;
 
 void init_swarm(PhysicsParams* phys, Particle* swarm, double start_price);
-void update_swarm_learning(Particle* swarm, PhysicsParams* phys, 
-                           double o, double h, double l, double c, 
-                           double vol_ratio, double diurnal_factor, double dt, 
-                           SwarmState* out);
+void update_swarm_regime(Particle* swarm, PhysicsParams* phys, 
+                         double o, double h, double l, double c, 
+                         double vol_ratio, double diurnal_factor, double dt, 
+                         SwarmState* out);
 
 #endif

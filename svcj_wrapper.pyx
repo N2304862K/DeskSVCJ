@@ -11,14 +11,15 @@ cdef extern from "svcj.h":
     ctypedef struct Particle:
         double v, mu, rho, weight
     ctypedef struct SwarmState:
-        double ev_vol, mode_vol, ev_drift, entropy
+        double mode_vol, entropy
+        double prob_bull, prob_bear, prob_neutral
         int collapsed
         
     void init_swarm(PhysicsParams* phys, Particle* swarm, double start_price) nogil
-    void update_swarm_learning(Particle* swarm, PhysicsParams* phys, 
-                               double o, double h, double l, double c, 
-                               double vol_ratio, double diurnal_factor, double dt, 
-                               SwarmState* out) nogil
+    void update_swarm_regime(Particle* swarm, PhysicsParams* phys, 
+                             double o, double h, double l, double c, 
+                             double vol_ratio, double diurnal_factor, double dt, 
+                             SwarmState* out) nogil
 
 cdef class IntradaySwarm:
     cdef PhysicsParams phys
@@ -34,21 +35,24 @@ cdef class IntradaySwarm:
         self.phys.sigma_j = params.get('sigma_j', 0.05)
         
         self.dt_base = dt_base
-        self.swarm = <Particle*> malloc(2000 * sizeof(Particle))
+        self.swarm = <Particle*> malloc(3000 * sizeof(Particle))
         init_swarm(&self.phys, self.swarm, start_price)
         
     def __dealloc__(self):
         if self.swarm: free(self.swarm)
-    
+            
     def update_tick(self, double o, double h, double l, double c, double v_ratio, double d_factor):
         cdef SwarmState out
         with nogil:
-            update_swarm_learning(self.swarm, &self.phys, o, h, l, c, v_ratio, d_factor, self.dt_base, &out)
+            update_swarm_regime(self.swarm, &self.phys, o, h, l, c, v_ratio, d_factor, self.dt_base, &out)
             
         return {
-            "ev_vol": out.ev_vol,
             "mode_vol": out.mode_vol,
-            "ev_drift": out.ev_drift,
             "entropy": out.entropy,
+            "probs": {
+                "bull": out.prob_bull,
+                "bear": out.prob_bear,
+                "neutral": out.prob_neutral
+            },
             "collapsed": bool(out.collapsed)
         }
