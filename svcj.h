@@ -5,13 +5,12 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #define SWARM_SIZE 5000
 #define SIM_SCENARIOS 50
-#define PATHS_PER_SCENARIO 200 // Higher paths for distribution fidelity
+#define PATHS_PER_SCENARIO 200
 #define N_COLS 5
-
-// --- Structures ---
 
 typedef struct {
     double kappa, theta, sigma_v, rho, lambda_j, mu_j, sigma_j;
@@ -24,43 +23,19 @@ typedef struct {
 } FilterStats;
 
 typedef struct {
-    double spread_bps;      // e.g. 0.0002 (2 bps)
-    double impact_coef;     // Impact per unit vol
-    double stop_sigma;
-    double target_sigma_init;
-    double decay_rate;      // Target decay per bar
+    double spread_bps, impact_coef, stop_sigma, target_sigma_init, decay_rate;
     int horizon;
 } MarketMicrostructure;
 
 typedef struct {
-    // Net Alpha (EV - Passive)
-    double alpha_long;
-    double alpha_short;
-    
-    // Statistical Discrimination
-    double t_stat_long;
-    double t_stat_short;
-    
-    // Separation Metric
-    double cohens_d;        // Distance between Long/Short Distributions
-    double overlap_prob;    // Probability that Long == Short (Confusion)
-    
-    // Integrity
-    double friction_cost_avg;
+    double alpha_long, alpha_short;
+    double t_stat_long, t_stat_short;
+    double cohens_d, friction_cost_avg;
 } ContrastiveResult;
 
-// --- Functions ---
 void compute_log_returns(double* ohlcv, int n, double* out);
 void generate_prior_swarm(double* ohlcv, int n, double dt, Particle* out);
 void run_particle_filter_step(Particle* sw, double ret, double dt, FilterStats* out);
-
-// The Contrastive Engine
-void run_contrastive_simulation(
-    Particle* swarm, 
-    double price, 
-    double dt, 
-    MarketMicrostructure micro, 
-    ContrastiveResult* out
-);
+void run_contrastive_simulation(Particle* sw, double p, double dt, MarketMicrostructure m, ContrastiveResult* r);
 
 #endif

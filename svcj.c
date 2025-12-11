@@ -4,17 +4,20 @@
 // --- RNG ---
 double norm_rand() {
     double u1 = (double)rand() / RAND_MAX;
+    if (u1 < 1e-9) u1 = 1e-9; // Safety
     double u2 = (double)rand() / RAND_MAX;
     return sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
 }
 double lognorm_rand(double mu, double std) { return exp(mu + std*norm_rand()); }
 
-// --- Filter Utils (Standard) ---
+// --- Utils ---
 void compute_log_returns(double* ohlcv, int n, double* out) {
     for(int i=1; i<n; i++) out[i-1] = log(ohlcv[i*N_COLS+3]/ohlcv[(i-1)*N_COLS+3]);
 }
+
 void generate_prior_swarm(double* ohlcv, int n, double dt, Particle* out) {
-    // Robust seeding based on realized variance
+    srand(time(NULL)); // Seed RNG
+    
     double sum_sq=0; for(int i=1; i<n; i++) { 
         double r=log(ohlcv[i*N_COLS+3]/ohlcv[(i-1)*N_COLS+3]); sum_sq+=r*r; 
     }
@@ -33,18 +36,18 @@ void generate_prior_swarm(double* ohlcv, int n, double dt, Particle* out) {
 
 void run_particle_filter_step(Particle* sw, double ret, double dt, FilterStats* out) {
     double sum_w=0, sum_sq=0, m_v=0, m_z=0;
+    
     for(int i=0; i<SWARM_SIZE; i++) {
         Particle* p = &sw[i];
         double vp = p->v + p->kappa*(p->theta - p->v)*dt; if(vp<1e-9)vp=1e-9;
-        double y = ret + 0.5*vp*dt; // simplified drift
+        double y = ret + 0.5*vp*dt;
         double S = vp*dt + p->lambda_j*p->sigma_j*p->sigma_j*dt;
         double ll = (1.0/sqrt(2*M_PI*S)) * exp(-0.5*y*y/S);
         p->weight *= ll; sum_w += p->weight;
-        // State prop
         p->v = vp + p->sigma_v*sqrt(vp*dt)*norm_rand(); if(p->v<1e-9)p->v=1e-9;
     }
     
-    if(sum_w < 1e-40) { // Reset
+    if(sum_w < 1e-40) { 
         for(int i=0; i<SWARM_SIZE; i++) sw[i].weight = 1.0/SWARM_SIZE; sum_w=1.0;
     }
     
@@ -53,7 +56,6 @@ void run_particle_filter_step(Particle* sw, double ret, double dt, FilterStats* 
         sw[i].weight /= sum_w;
         sum_sq += sw[i].weight*sw[i].weight;
         m_v += sw[i].weight * sqrt(sw[i].v);
-        // Innovation Z
         double tot = sw[i].v + sw[i].lambda_j*sw[i].sigma_j*sw[i].sigma_j;
         m_z += sw[i].weight * (ret / sqrt(tot*dt));
         if(sw[i].weight > 1e-12) entropy -= sw[i].weight*log(sw[i].weight);
@@ -63,7 +65,7 @@ void run_particle_filter_step(Particle* sw, double ret, double dt, FilterStats* 
     out->ess = 1.0/sum_sq;
     out->entropy = entropy;
     
-    // Resample logic omitted for brevity, assumed standard SIR
+    // Resample
     if(out->ess < SWARM_SIZE/4) {
         Particle* nw = malloc(SWARM_SIZE*sizeof(Particle));
         double c=0, u=((double)rand()/RAND_MAX)/SWARM_SIZE; int k=0;
@@ -76,7 +78,6 @@ void run_particle_filter_step(Particle* sw, double ret, double dt, FilterStats* 
     }
 }
 
-// --- NEW: CONTRASTIVE SIMULATION ENGINE ---
 void run_contrastive_simulation(Particle* swarm, double price, double dt, MarketMicrostructure micro, ContrastiveResult* out) {
     // 1. Select Scenarios
     Particle scenarios[SIM_SCENARIOS];
@@ -87,36 +88,24 @@ void run_contrastive_simulation(Particle* swarm, double price, double dt, Market
         scenarios[i] = swarm[k-1];
     }
     
-    // Accumulators for distributions
-    double s_l=0, s2_l=0; // Long
-    double s_s=0, s2_s=0; // Short
-    double s_h=0;         // Hold (Passive)
-    double s_fric=0;      // Friction tracking
-    
+    double s_l=0, s2_l=0, s_s=0, s2_s=0, s_h=0, s_fric=0;
     int n_sims = SIM_SCENARIOS * PATHS_PER_SCENARIO;
     
     for(int s=0; s<SIM_SCENARIOS; s++) {
         Particle p = scenarios[s];
-        
-        // Friction: Spread + Impact scaled by Volatility Regime
         double current_vol = sqrt(p.v);
         double cost = price * (micro.spread_bps + micro.impact_coef * current_vol);
         s_fric += cost;
         
+        double stop_dist = micro.stop_sigma * current_vol * sqrt(dt) * price;
+        
         for(int n=0; n<PATHS_PER_SCENARIO; n++) {
             double p_curr = price;
             double v_curr = p.v;
-            
-            // Path State
             double pnl_l = 0, pnl_s = 0;
             int closed_l = 0, closed_s = 0;
             
-            // Physical Barriers
-            double stop_dist = micro.stop_sigma * current_vol * sqrt(dt) * price;
-            
-            // Time Loop
             for(int t=0; t<micro.horizon; t++) {
-                // SDE Step
                 double dW = norm_rand();
                 v_curr += p.kappa*(p.theta - v_curr)*dt + p.sigma_v*sqrt(v_curr*dt)*norm_rand();
                 if(v_curr<1e-9) v_curr=1e-9;
@@ -126,32 +115,25 @@ void run_contrastive_simulation(Particle* swarm, double price, double dt, Market
                 
                 p_curr *= (1.0 + sqrt(v_curr*dt)*dW + jump);
                 
-                // Dynamic Target (Cone of Silence)
-                // Target shrinks as time passes (Decay)
+                // Decay
                 double decay_factor = exp(-micro.decay_rate * t);
                 double target_dist = micro.target_sigma_init * decay_factor * current_vol * sqrt(dt) * price;
                 
                 double diff = p_curr - price;
-                
-                // Evaluate Long
                 if(!closed_l) {
                     if(diff < -stop_dist) { pnl_l = -stop_dist - cost; closed_l=1; }
                     if(diff > target_dist) { pnl_l = target_dist - cost; closed_l=1; }
                 }
-                
-                // Evaluate Short
                 if(!closed_s) {
                     if(diff > stop_dist) { pnl_s = -stop_dist - cost; closed_s=1; }
                     if(diff < -target_dist) { pnl_s = target_dist - cost; closed_s=1; }
                 }
-                
                 if(closed_l && closed_s) break;
             }
             
-            // Mark to Market if not closed
             if(!closed_l) pnl_l = (p_curr - price) - cost;
             if(!closed_s) pnl_s = (price - p_curr) - cost;
-            double pnl_h = (p_curr - price); // Passive Hold (No cost)
+            double pnl_h = (p_curr - price);
             
             s_l += pnl_l; s2_l += pnl_l*pnl_l;
             s_s += pnl_s; s2_s += pnl_s*pnl_s;
@@ -159,7 +141,6 @@ void run_contrastive_simulation(Particle* swarm, double price, double dt, Market
         }
     }
     
-    // Stats
     double mu_l = s_l / n_sims;
     double var_l = (s2_l/n_sims) - mu_l*mu_l;
     double std_l = sqrt(var_l);
@@ -168,28 +149,15 @@ void run_contrastive_simulation(Particle* swarm, double price, double dt, Market
     double var_s = (s2_s/n_sims) - mu_s*mu_s;
     double std_s = sqrt(var_s);
     
-    double mu_h = s_h / n_sims; // Passive drift
+    double mu_h = s_h / n_sims;
     
     out->friction_cost_avg = s_fric / SIM_SCENARIOS;
-    
-    // 1. Net Alpha (Strategy - Passive Drift)
-    // For Short, Passive Drift works against you, so we subtract (-mu_h) -> add mu_h? 
-    // No, compare strategy payoff to doing nothing.
     out->alpha_long = mu_l - mu_h; 
     out->alpha_short = mu_s - (-mu_h); 
     
-    // 2. T-Statistics
     out->t_stat_long = (std_l > 1e-9) ? (mu_l / (std_l/sqrt(n_sims))) : 0;
     out->t_stat_short = (std_s > 1e-9) ? (mu_s / (std_s/sqrt(n_sims))) : 0;
     
-    // 3. Discrimination (Cohen's D)
-    // Distance between the Long and Short outcomes
     double pooled_std = sqrt((var_l + var_s)/2.0);
-    if(pooled_std < 1e-9) pooled_std = 1e-9;
-    
-    out->cohens_d = fabs(mu_l - mu_s) / pooled_std;
-    
-    // Overlap Probability (Gaussian approx)
-    // If D is small, distributions overlap -> Indistinguishable -> Wait
-    // If D is large, clear separation -> Act
+    out->cohens_d = (pooled_std > 1e-9) ? fabs(mu_l - mu_s) / pooled_std : 0;
 }

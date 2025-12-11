@@ -46,14 +46,10 @@ cdef class ParticleEngine:
         return {
             "spot_vol": s.spot_vol_mean,
             "z": s.innovation_z,
-            "ess": s.ess,
-            "entropy": s.entropy
+            "ess": s.ess
         }
     
     def evaluate_contrastive(self, double price, dict config):
-        """
-        Runs the full Long vs Short vs Hold tournament.
-        """
         cdef MarketMicrostructure m
         m.spread_bps = config.get('spread_bps', 0.0002)
         m.impact_coef = config.get('impact', 0.1)
@@ -64,7 +60,6 @@ cdef class ParticleEngine:
         
         cdef ContrastiveResult r
         
-        # Release GIL for MC Simulation
         with nogil:
             run_contrastive_simulation(self.swarm, price, self.dt, m, &r)
             
