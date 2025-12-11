@@ -9,22 +9,15 @@
 
 #define N_PARTICLES 2000
 #define MIN_EFFECTIVE_PARTICLES 1000
+#define CHI_SQ_CUTOFF 9.0
 
-// Lean Particle (State Only)
 typedef struct {
-    double v;
-    double mu;
-    double rho;
-    double weight;
-    double last_log_p;
+    double v;           
+    double mu;          
+    double rho;         
+    double weight;      
+    double last_log_p;  
 } Particle;
-
-typedef struct {
-    double trend_fast;
-    double trend_mid;
-    double trend_slow;
-    double coherence;
-} TrendState;
 
 typedef struct {
     double ev_vol;
@@ -32,7 +25,6 @@ typedef struct {
     double ev_drift;
     double entropy;
     int collapsed;
-    double trend_coherence;
 } SwarmState;
 
 typedef struct {
@@ -44,11 +36,11 @@ typedef struct {
     double sigma_j;
 } PhysicsParams;
 
-void init_swarm(PhysicsParams* phys, Particle* swarm, double start_price, TrendState* ts);
-void update_swarm(Particle* swarm, TrendState* ts, PhysicsParams* phys, 
+void init_swarm(PhysicsParams* phys, Particle* swarm, double start_price);
+// Updated Prototype
+void update_swarm(Particle* swarm, PhysicsParams* phys, 
                   double o, double h, double l, double c, 
-                  double vol_ratio, double diurnal_factor, double dt, 
-                  double prev_entropy,
+                  double vol_ratio, double diurnal_factor, double macro_momentum, double dt, 
                   SwarmState* out);
 
 #endif

@@ -1,5 +1,6 @@
 #include "svcj.h"
 
+// Xorshift RNG
 uint64_t s[2] = {123456789, 987654321};
 uint64_t next_rand(void) {
     uint64_t x = s[0];
@@ -18,11 +19,8 @@ double rand_normal() {
     return sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
 }
 
-void init_swarm(PhysicsParams* phys, Particle* swarm, double start_price, TrendState* ts) {
+void init_swarm(PhysicsParams* phys, Particle* swarm, double start_price) {
     double log_p = log(start_price);
-    
-    ts->trend_fast = 0; ts->trend_mid = 0; ts->trend_slow = 0; ts->coherence = 0;
-    
     for(int i=0; i<N_PARTICLES; i++) {
         swarm[i].v = phys->theta; 
         swarm[i].mu = 0.0;
@@ -30,19 +28,6 @@ void init_swarm(PhysicsParams* phys, Particle* swarm, double start_price, TrendS
         swarm[i].weight = 1.0 / N_PARTICLES;
         swarm[i].last_log_p = log_p;
     }
-}
-
-void update_trends(TrendState* ts, double ret) {
-    // Standard EMAs
-    ts->trend_fast += 0.2 * (ret - ts->trend_fast);
-    ts->trend_mid  += 0.05 * (ret - ts->trend_mid);
-    ts->trend_slow += 0.01 * (ret - ts->trend_slow);
-    
-    double s1 = (ts->trend_fast > 0) ? 1 : -1;
-    double s2 = (ts->trend_mid > 0) ? 1 : -1;
-    double s3 = (ts->trend_slow > 0) ? 1 : -1;
-    
-    ts->coherence = (s1 + s2 + s3) / 3.0;
 }
 
 double calc_range_likelihood(double h, double l, double v, double dt) {
@@ -53,14 +38,13 @@ double calc_range_likelihood(double h, double l, double v, double dt) {
     double var_est = safe_v * dt * 0.5; 
     if(var_est < 1e-12) var_est = 1e-12;
     double m_dist = (diff*diff) / var_est;
-    if (m_dist > 16.0) return 1e-18; 
+    if (m_dist > 16.0) return 1e-15; 
     return exp(-1.0 * m_dist);
 }
 
-void update_swarm(Particle* swarm, TrendState* ts, PhysicsParams* phys, 
+void update_swarm(Particle* swarm, PhysicsParams* phys, 
                   double o, double h, double l, double c, 
-                  double vol_ratio, double diurnal_factor, double dt, 
-                  double prev_entropy,
+                  double vol_ratio, double diurnal_factor, double macro_momentum, double dt, 
                   SwarmState* out) 
 {
     double sum_weight = 0.0;
@@ -73,42 +57,31 @@ void update_swarm(Particle* swarm, TrendState* ts, PhysicsParams* phys,
     double dt_eff = dt * vol_ratio;
     double theta_eff = phys->theta * diurnal_factor;
 
-    // 1. Update Global Trend
-    // Use first particle history to estimate return (robust enough)
-    double raw_ret = log_c - swarm[0].last_log_p;
-    update_trends(ts, raw_ret);
-    out->global_trend_coherence = ts->coherence;
-
-    // 2. Adaptive Logic
-    // If Coherence is high (Trend), reduce Vol Noise (Stability)
-    double noise_scale = 1.0 - (0.8 * fabs(ts->coherence));
-    
-    // If Entropy is High, Increase Temperature (Force Decision)
-    double temperature = 1.0 + (prev_entropy * 8.0); // Max power ~9.0
-
-    // --- A. PROPAGATE ---
+    // --- A. PROPAGATE WITH MOMENTUM INJECTION ---
     for(int i=0; i<N_PARTICLES; i++) {
         Particle* p = &swarm[i];
         
         double dw_v = rand_normal();
-        double dw_d = rand_normal();
+        double dw_drift = rand_normal();
         
-        // Variance (Heston)
-        p->v += phys->kappa * (theta_eff - p->v) * dt_eff + 
-                phys->sigma_v * sqrt(p->v) * dw_v * sqrt(dt_eff) * noise_scale;
-                
+        // 1. Variance
+        p->v += phys->kappa * (theta_eff - p->v) * dt_eff + phys->sigma_v * sqrt(p->v) * dw_v * sqrt(dt_eff);
         if(p->v < 1e-6) p->v = 1e-6;
         if(p->v > 20.0) p->v = 20.0;
         
-        // Drift (Guided)
-        // Pull towards Global Trend
-        double target = ts->trend_fast / dt_eff; // Annualize trend
-        p->mu += 2.0 * (target - p->mu) * dt_eff + 
-                 0.5 * sqrt(p->v) * dw_d * sqrt(dt_eff);
-                 
-        if(p->mu > 20.0) p->mu = 20.0;
-        if(p->mu < -20.0) p->mu = -20.0;
+        // 2. Drift with Momentum Gravity
+        // Logic: Particles shouldn't just random walk. They should be pulled towards the Macro Trend.
+        // Mean Reversion Force = 5.0 (Strong Pull)
+        // Noise = Scaled by Vol
         
+        double drift_pull = 5.0 * (macro_momentum - p->mu) * dt_eff;
+        double drift_noise = 0.5 * sqrt(p->v) * dw_drift * sqrt(dt_eff);
+        
+        p->mu += drift_pull + drift_noise;
+        
+        if(p->mu > 10.0) p->mu = 10.0; if(p->mu < -10.0) p->mu = -10.0;
+        
+        // 3. Jump
         int is_jump = 0;
         if ((next_rand()%10000)/10000.0 < (phys->lambda_j * dt_eff)) is_jump = 1;
         
@@ -116,27 +89,30 @@ void update_swarm(Particle* swarm, TrendState* ts, PhysicsParams* phys,
         double pred = p->last_log_p + (p->mu - 0.5*p->v)*dt_eff + (is_jump ? phys->mu_j : 0);
         double innov = log_c - pred;
         double var_tot = p->v*dt_eff + (is_jump ? (phys->mu_j*phys->mu_j + phys->sigma_j*phys->sigma_j) : 0);
-        if(var_tot < 1e-12) var_tot = 1e-12;
+        if(var_tot < 1e-9) var_tot = 1e-9;
         
         double m_dist = (innov * innov) / var_tot;
         
         double like_ret = 0.0;
-        if (m_dist > 25.0) like_ret = 1e-25;
-        else like_ret = (1.0/sqrt(2*M_PI*var_tot)) * exp(-0.5 * m_dist);
+        if (m_dist > 12.0) { // 3.5 Sigma gate
+            like_ret = 1e-25; 
+        } else {
+            like_ret = (1.0/sqrt(2*M_PI*var_tot)) * exp(-0.5 * m_dist);
+        }
         
         double like_rng = calc_range_likelihood(h, l, p->v, dt_eff);
-        double raw_w = like_ret * like_rng;
         
-        // TEMPERATURE APPLICATION
-        p->weight *= pow(raw_w, temperature);
+        // --- C. CONTRAST BOOST ---
+        // Power 6.0: Very aggressive entropy reduction
+        double raw_w = like_ret * like_rng;
+        p->weight *= pow(raw_w, 6.0); 
         
         p->last_log_p = log_c;
         if(p->weight < 1e-150) p->weight = 1e-150;
-        
         sum_weight += p->weight;
     }
     
-    // --- C. LAZARUS RESET ---
+    // --- D. LAZARUS ---
     int collapsed = 0;
     if(sum_weight < 1e-100 || isnan(sum_weight)) {
         collapsed = 1;
@@ -144,18 +120,19 @@ void update_swarm(Particle* swarm, TrendState* ts, PhysicsParams* phys,
         for(int i=0; i<N_PARTICLES; i++) {
             swarm[i].weight = 1.0 / N_PARTICLES;
             swarm[i].v = theta_eff;
-            swarm[i].mu = ts->trend_fast / dt_eff;
+            swarm[i].mu = macro_momentum; // Reset to Macro Trend, not 0
         }
     }
     out->collapsed = collapsed;
 
-    // --- D. AGGREGATE ---
+    // --- E. AGGREGATE ---
     double entropy = 0;
-    out->ev_vol = 0; out->ev_drift = 0;
+    out->ev_vol = 0;
+    out->ev_drift = 0;
     
     #define BINS 50
     double bins[BINS] = {0};
-    double max_v = theta_eff * 8.0;
+    double max_v = theta_eff * 5.0;
     
     for(int i=0; i<N_PARTICLES; i++) {
         swarm[i].weight /= sum_weight;
@@ -163,6 +140,7 @@ void update_swarm(Particle* swarm, TrendState* ts, PhysicsParams* phys,
         sum_sq_weight += w*w;
         
         if(w > 1e-12) entropy -= w * log(w);
+        
         out->ev_vol += w * sqrt(swarm[i].v);
         out->ev_drift += w * swarm[i].mu;
         
@@ -172,16 +150,13 @@ void update_swarm(Particle* swarm, TrendState* ts, PhysicsParams* phys,
     }
     
     out->entropy = entropy / log(N_PARTICLES);
+    
     int best_b = 0;
     for(int i=1; i<BINS; i++) if(bins[i] > bins[best_b]) best_b = i;
     out->mode_vol = sqrt(((double)best_b/BINS)*max_v + (0.5/BINS)*max_v);
     
-    // --- E. RESAMPLE (Adaptive) ---
-    // If Entropy is Low (Crystallized), use HIGHER jitter to explore (0.05).
-    // If Entropy is High (Confused), use LOWER jitter to converge (0.001).
-    double jitter = (out->entropy < 0.5) ? 0.05 : 0.001;
-    
-    if(1.0/sum_sq_weight < (N_PARTICLES * 0.5)) {
+    // --- F. RESAMPLE ---
+    if(1.0/sum_sq_weight < (N_PARTICLES * 0.6)) { // Resample earlier (60%)
         Particle* new_s = malloc(N_PARTICLES * sizeof(Particle));
         double r = (next_rand()%10000)/10000.0 * (1.0/N_PARTICLES);
         double c_w = swarm[0].weight;
@@ -194,8 +169,10 @@ void update_swarm(Particle* swarm, TrendState* ts, PhysicsParams* phys,
             new_s[m] = swarm[i];
             new_s[m].weight = 1.0/N_PARTICLES;
             
-            new_s[m].v *= (1.0 + jitter * rand_normal());
-            new_s[m].mu += jitter * rand_normal();
+            // Jitter
+            new_s[m].v *= (0.99 + 0.02 * ((next_rand()%1000)/1000.0));
+            // Drift Jitter: Allow exploration around the winning hypothesis
+            new_s[m].mu += 0.05 * rand_normal(); 
             new_s[m].rho = swarm[i].rho;
         }
         memcpy(swarm, new_s, N_PARTICLES * sizeof(Particle));
