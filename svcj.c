@@ -4,13 +4,13 @@
 // --- RNG ---
 double norm_rand() {
     double u1 = (double)rand() / RAND_MAX;
-    if(u1 < 1e-9) u1 = 1e-9;
+    if (u1 < 1e-9) u1 = 1e-9;
     double u2 = (double)rand() / RAND_MAX;
     return sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
 }
 double lognorm_rand(double mu, double std) { return exp(mu + std*norm_rand()); }
 
-// --- Utils ---
+// --- Standard Filter Logic ---
 void compute_log_returns(double* ohlcv, int n, double* out) {
     for(int i=1; i<n; i++) out[i-1] = log(ohlcv[i*N_COLS+3]/ohlcv[(i-1)*N_COLS+3]);
 }
@@ -76,8 +76,8 @@ void run_particle_filter_step(Particle* sw, double ret, double dt, FilterStats* 
     }
 }
 
-// --- CONTRASTIVE ENGINE WITH MOMENTUM ---
-void run_contrastive_simulation(Particle* swarm, double price, double current_z, double dt, MarketMicrostructure micro, ContrastiveResult* out) {
+// --- NEW: ASYMMETRIC SIMULATION ENGINE ---
+void run_asymmetric_simulation(Particle* swarm, double price, double z_score, double dt, MarketMicrostructure m, ContrastiveResult* out) {
     Particle scenarios[SIM_SCENARIOS];
     double u = ((double)rand()/RAND_MAX)/SIM_SCENARIOS; double c=0; int k=0;
     for(int i=0; i<SIM_SCENARIOS; i++) {
@@ -89,19 +89,25 @@ void run_contrastive_simulation(Particle* swarm, double price, double current_z,
     double s_l=0, s2_l=0, s_s=0, s2_s=0, s_h=0, s_fric=0;
     int n_sims = SIM_SCENARIOS * PATHS_PER_SCENARIO;
     
+    // --- PHYSICS POLARIZATION ---
+    // Bias physics based on Z-Score magnitude
+    // If Z > 0, Up Jumps are more likely.
+    double bias_up = (z_score > 0) ? (1.0 + 0.3*fabs(z_score)) : (1.0 / (1.0 + 0.3*fabs(z_score)));
+    double bias_down = 1.0 / bias_up;
+    
     for(int s=0; s<SIM_SCENARIOS; s++) {
         Particle p = scenarios[s];
         double current_vol = sqrt(p.v);
-        double cost = price * (micro.spread_bps + micro.impact_coef * current_vol);
-        s_fric += cost;
         
-        // MOMENTUM INJECTION:
-        // Z-Score is essentially "Standard Deviations of Velocity".
-        // We convert Z to an initial drift rate.
-        // If Z=2.0, market is moving 2 sigma/dt.
-        double momentum_drift_annual = current_z * current_vol; 
+        // Directional Friction: Cheaper to trade WITH momentum
+        // Z > 0 (Up) -> Long cost low, Short cost high
+        double cost_long = price * (m.spread_bps + m.impact_coef * current_vol * (z_score > 0 ? 0.7 : 1.3));
+        double cost_short = price * (m.spread_bps + m.impact_coef * current_vol * (z_score < 0 ? 0.7 : 1.3));
         
-        double stop_dist = micro.stop_sigma * current_vol * sqrt(dt) * price;
+        // Track avg friction for reporting
+        s_fric += (cost_long + cost_short) / 2.0;
+        
+        double stop_dist = m.stop_sigma * current_vol * sqrt(dt) * price;
         
         for(int n=0; n<PATHS_PER_SCENARIO; n++) {
             double p_curr = price;
@@ -109,40 +115,43 @@ void run_contrastive_simulation(Particle* swarm, double price, double current_z,
             double pnl_l = 0, pnl_s = 0;
             int closed_l = 0, closed_s = 0;
             
-            for(int t=0; t<micro.horizon; t++) {
+            for(int t=0; t<m.horizon; t++) {
+                // Conditional Volatility (Feedback Loop)
+                // If price moves WITH Z-Score, dampen Sigma (Trend Stability)
+                // If price moves AGAINST Z-Score, amplify Sigma (Turbulence)
+                double move_dir = (p_curr - price);
+                double regime_stab = (move_dir * z_score > 0) ? 0.5 : 1.5; 
+                
                 double dW = norm_rand();
-                v_curr += p.kappa*(p.theta - v_curr)*dt + p.sigma_v*sqrt(v_curr*dt)*norm_rand();
+                v_curr += p.kappa*(p.theta - v_curr)*dt + (p.sigma_v * regime_stab)*sqrt(v_curr*dt)*norm_rand();
                 if(v_curr<1e-9) v_curr=1e-9;
                 
+                // Asymmetric Jumps
                 double jump = 0;
-                if( ((double)rand()/RAND_MAX) < p.lambda_j*dt ) jump = -0.05 + 0.1*norm_rand();
+                if (((double)rand()/RAND_MAX) < p.lambda_j * bias_up * dt) jump += (0.02 + 0.05*norm_rand());
+                if (((double)rand()/RAND_MAX) < p.lambda_j * bias_down * dt) jump -= (0.02 + 0.05*norm_rand());
                 
-                // DECAYING MOMENTUM:
-                // Drift isn't permanent. It decays based on Mean Reversion (Kappa).
-                double current_drift = momentum_drift_annual * exp(-p.kappa * t * dt);
+                p_curr *= (1.0 + sqrt(v_curr*dt)*dW + jump);
                 
-                // SDE with Drift Bias
-                p_curr *= (1.0 + (current_drift * dt) + sqrt(v_curr*dt)*dW + jump);
-                
-                // Cone of Silence (Target Decay)
-                double decay_factor = exp(-micro.decay_rate * t);
-                double target_dist = micro.target_sigma_init * decay_factor * current_vol * sqrt(dt) * price;
+                // Decay
+                double decay = exp(-m.decay_rate * t);
+                double target = m.target_sigma_init * decay * current_vol * sqrt(dt) * price;
                 
                 double diff = p_curr - price;
                 if(!closed_l) {
-                    if(diff < -stop_dist) { pnl_l = -stop_dist - cost; closed_l=1; }
-                    if(diff > target_dist) { pnl_l = target_dist - cost; closed_l=1; }
+                    if(diff < -stop_dist) { pnl_l = -stop_dist - cost_long; closed_l=1; }
+                    if(diff > target) { pnl_l = target - cost_long; closed_l=1; }
                 }
                 if(!closed_s) {
-                    if(diff > stop_dist) { pnl_s = -stop_dist - cost; closed_s=1; }
-                    if(diff < -target_dist) { pnl_s = target_dist - cost; closed_s=1; }
+                    if(diff > stop_dist) { pnl_s = -stop_dist - cost_short; closed_s=1; }
+                    if(diff < -target) { pnl_s = target - cost_short; closed_s=1; }
                 }
                 if(closed_l && closed_s) break;
             }
             
-            if(!closed_l) pnl_l = (p_curr - price) - cost;
-            if(!closed_s) pnl_s = (price - p_curr) - cost;
-            double pnl_h = (p_curr - price);
+            if(!closed_l) pnl_l = (p_curr - price) - cost_long;
+            if(!closed_s) pnl_s = (price - p_curr) - cost_short;
+            double pnl_h = (p_curr - price); 
             
             s_l += pnl_l; s2_l += pnl_l*pnl_l;
             s_s += pnl_s; s2_s += pnl_s*pnl_s;
@@ -151,12 +160,10 @@ void run_contrastive_simulation(Particle* swarm, double price, double current_z,
     }
     
     double mu_l = s_l / n_sims;
-    double var_l = (s2_l/n_sims) - mu_l*mu_l;
-    double std_l = sqrt(var_l);
+    double std_l = sqrt((s2_l/n_sims) - mu_l*mu_l);
     
     double mu_s = s_s / n_sims;
-    double var_s = (s2_s/n_sims) - mu_s*mu_s;
-    double std_s = sqrt(var_s);
+    double std_s = sqrt((s2_s/n_sims) - mu_s*mu_s);
     
     double mu_h = s_h / n_sims;
     
@@ -167,6 +174,6 @@ void run_contrastive_simulation(Particle* swarm, double price, double current_z,
     out->t_stat_long = (std_l > 1e-9) ? (mu_l / (std_l/sqrt(n_sims))) : 0;
     out->t_stat_short = (std_s > 1e-9) ? (mu_s / (std_s/sqrt(n_sims))) : 0;
     
-    double pooled_std = sqrt((var_l + var_s)/2.0);
+    double pooled_std = sqrt((std_l*std_l + std_s*std_s)/2.0);
     out->cohens_d = (pooled_std > 1e-9) ? fabs(mu_l - mu_s) / pooled_std : 0;
 }

@@ -30,18 +30,19 @@ typedef struct {
 typedef struct {
     double alpha_long, alpha_short;
     double t_stat_long, t_stat_short;
-    double cohens_d, friction_cost_avg;
+    double cohens_d;
+    double friction_cost_avg;
 } ContrastiveResult;
 
 void compute_log_returns(double* ohlcv, int n, double* out);
 void generate_prior_swarm(double* ohlcv, int n, double dt, Particle* out);
 void run_particle_filter_step(Particle* sw, double ret, double dt, FilterStats* out);
 
-// Updated: Accepts current_z to bias the paths
-void run_contrastive_simulation(
+// The Asymmetric Engine
+void run_asymmetric_simulation(
     Particle* sw, 
     double price, 
-    double current_z, 
+    double z_score, 
     double dt, 
     MarketMicrostructure m, 
     ContrastiveResult* r

@@ -19,8 +19,7 @@ cdef extern from "svcj.h":
         
     void generate_prior_swarm(double* ohlcv, int n, double dt, Particle* out) nogil
     void run_particle_filter_step(Particle* sw, double ret, double dt, FilterStats* out) nogil
-    # Updated signature
-    void run_contrastive_simulation(Particle* sw, double p, double z, double dt, MarketMicrostructure m, ContrastiveResult* r) nogil
+    void run_asymmetric_simulation(Particle* sw, double p, double z, double dt, MarketMicrostructure m, ContrastiveResult* r) nogil
 
 cdef np.ndarray[double, ndim=2, mode='c'] _sanitize(object d):
     return np.ascontiguousarray(np.asarray(d, dtype=np.float64))
@@ -51,7 +50,7 @@ cdef class ParticleEngine:
             "entropy": s.entropy
         }
     
-    def evaluate_contrastive(self, double price, double z_score, dict config):
+    def evaluate_asymmetric(self, double price, double z_score, dict config):
         cdef MarketMicrostructure m
         m.spread_bps = config.get('spread_bps', 0.0002)
         m.impact_coef = config.get('impact', 0.1)
@@ -63,8 +62,7 @@ cdef class ParticleEngine:
         cdef ContrastiveResult r
         
         with nogil:
-            # Pass Z-Score to drive momentum
-            run_contrastive_simulation(self.swarm, price, z_score, self.dt, m, &r)
+            run_asymmetric_simulation(self.swarm, price, z_score, self.dt, m, &r)
             
         return {
             "alpha_long": r.alpha_long,
