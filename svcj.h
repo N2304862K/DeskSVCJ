@@ -9,14 +9,14 @@
 
 #define N_PARTICLES 2000
 #define MIN_EFFECTIVE_PARTICLES 1000
-#define CHI_SQ_CUTOFF 9.0 // 3-Sigma event threshold (Mahalanobis Distance)
+#define CHI_SQ_CUTOFF 9.0
 
 typedef struct {
-    double v;           // Variance
-    double mu;          // Drift
-    double rho;         // Correlation
-    double weight;      // Probability
-    double last_log_p;  // Memory
+    double v;
+    double mu;
+    double rho;
+    double weight;
+    double last_log_p;
 } Particle;
 
 typedef struct {
@@ -39,7 +39,7 @@ typedef struct {
 void init_swarm(PhysicsParams* phys, Particle* swarm, double start_price);
 void update_swarm(Particle* swarm, PhysicsParams* phys, 
                   double o, double h, double l, double c, 
-                  double vol_ratio, double diurnal_factor, double dt, 
+                  double vol_ratio, double diurnal_factor, double momentum_bias, double dt, 
                   SwarmState* out);
 
 #endif
