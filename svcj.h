@@ -5,32 +5,41 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
 
-#define N_STATES 3 // Bull, Bear, Neutral
-#define MAX_ITER 50 // Baum-Welch Iterations
-#define SQRT_2PI 2.50662827463
-#define N_COLS 5
+#define N_PARTICLES 2000
+#define MIN_EFFECTIVE_PARTICLES 1000
+#define CHI_SQ_CUTOFF 9.0
 
-// The Physics of a SINGLE Regime (State)
 typedef struct {
-    double mu;           // Drift
-    double sigma;        // Volatility
-} HMMStateParams;
+    double v;
+    double mu;
+    double rho;
+    double weight;
+    double last_log_p;
+} Particle;
 
-// The Full HMM Model
 typedef struct {
-    HMMStateParams states[N_STATES];
-    double transitions[N_STATES][N_STATES]; // A[i][j] = Prob(State i -> State j)
-    double initial_probs[N_STATES];
-} HMMModel;
+    double ev_vol;
+    double mode_vol;
+    double ev_drift;
+    double entropy;
+    int collapsed;
+} SwarmState;
 
-// Core Utils
-void compute_log_returns(double* ohlcv, int n, double* out_returns);
+typedef struct {
+    double kappa;
+    double theta;
+    double sigma_v;
+    double lambda_j;
+    double mu_j;
+    double sigma_j;
+} PhysicsParams;
 
-// Baum-Welch Algorithm (The "Solver")
-void run_baum_welch(double* returns, int n, HMMModel* model);
-
-// Viterbi Algorithm (The "Decoder")
-void decode_states_viterbi(double* returns, int n, HMMModel* model, int* out_path);
+void init_swarm(PhysicsParams* phys, Particle* swarm, double start_price);
+void update_swarm(Particle* swarm, PhysicsParams* phys, 
+                  double o, double h, double l, double c, 
+                  double vol_ratio, double diurnal_factor, double momentum_bias, double dt, 
+                  SwarmState* out);
 
 #endif

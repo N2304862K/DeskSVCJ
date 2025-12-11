@@ -154,7 +154,7 @@ void decode_states_viterbi(double* returns, int n, HMMModel* model, int* out_pat
     int last_state = 0;
     for(int i=0; i<N_STATES; i++) {
         if(T1[(n-1)*N_STATES + i] > max_final) {
-            max_final = T1[(n-1)*N_COLS + i];
+            max_final = T1[(n-1)*N_STATES + i];
             last_state = i;
         }
     }

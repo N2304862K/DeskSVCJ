@@ -5,13 +5,16 @@ import numpy as np
 cimport numpy as np
 
 cdef extern from "svcj.h":
+    ctypedef struct HMMStateParams:
+        double mu, sigma
     ctypedef struct HMMModel:
-        pass
-    
+        HMMStateParams states[3]
+        double transitions[3][3]
+
     void compute_log_returns(double* ohlcv, int n, double* out) nogil
     void run_baum_welch(double* returns, int n, HMMModel* model) nogil
     void decode_states_viterbi(double* returns, int n, HMMModel* model, int* out) nogil
-    
+
 cdef np.ndarray[double, ndim=2, mode='c'] _sanitize(object d):
     return np.ascontiguousarray(np.asarray(d, dtype=np.float64))
 
@@ -27,13 +30,10 @@ def fit_hmm(object ohlcv):
     cdef np.ndarray[double, ndim=1] returns = np.zeros(n_ret)
     compute_log_returns(&data[0,0], n, &returns[0])
     
-    # Create Model struct in C memory
     cdef HMMModel model
     
-    # Run Solver
     run_baum_welch(&returns[0], n_ret, &model)
     
-    # Unpack to Python dict
     return {
         "states": [
             {'mu': model.states[0].mu, 'sigma': model.states[0].sigma},
@@ -55,7 +55,6 @@ def decode_regime_path(object ohlcv, dict model_params):
     cdef np.ndarray[double, ndim=1] returns = np.zeros(n_ret)
     compute_log_returns(&data[0,0], n, &returns[0])
     
-    # Pack Python dict -> C struct
     cdef HMMModel model
     for i in range(3):
         model.states[i].mu = model_params['states'][i]['mu']
@@ -66,10 +65,8 @@ def decode_regime_path(object ohlcv, dict model_params):
         for j in range(3):
             model.transitions[i][j] = trans[i,j]
     
-    # Allocate output buffer
     cdef np.ndarray[int, ndim=1, mode='c'] path = np.zeros(n_ret, dtype=np.int32)
     
-    # Run Viterbi
     decode_states_viterbi(&returns[0], n_ret, &model, &path[0])
     
     return path
