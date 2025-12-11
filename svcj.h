@@ -5,45 +5,36 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <stdint.h>
 
-// 3 Swarms x 1000 Particles
-#define N_SUB_PARTICLES 1000
-#define N_TOTAL (N_SUB_PARTICLES * 3)
+#define N_PARTICLES 3000
+#define N_COLS 5 // OHLCV
+#define SQRT_2PI 2.50662827463
 
+// The State of a Single Particle
 typedef struct {
-    double v;
-    double mu;
-    double rho;
-    double weight;
-    double last_log_p;
+    double v;            // Current Variance
+    double mu;           // Current Drift (Mean-Reverting)
+    double weight;       // The Likelihood
+    int regime;          // 0=Bull, 1=Bear, 2=Neutral
 } Particle;
 
+// The Host Filter State
 typedef struct {
-    // Regime Probabilities (The Signal)
-    double prob_bull;
-    double prob_bear;
-    double prob_neutral;
-    
-    // Physics State (Weighted Average)
-    double agg_vol;
-    double agg_drift;
+    // Aggregates
+    double p_bull;
+    double p_bear;
+    double p_neutral;
     double entropy;
-} IMMState;
-
-typedef struct {
+    
+    // Core SVCJ Physics (Fixed per filter instance)
     double kappa;
     double theta;
     double sigma_v;
-    double lambda_j;
-    double mu_j;
-    double sigma_j;
-} PhysicsParams;
+    double dt;
+} IMMState;
 
-void init_imm(PhysicsParams* phys, Particle* particles, double start_price);
-void update_imm(Particle* particles, PhysicsParams* phys, 
-                double o, double h, double l, double c, 
-                double vol_ratio, double diurnal_factor, double dt, 
-                IMMState* out);
+// Core functions exposed to Cython
+void init_particle_set(Particle* particles, double theta, double start_price);
+void update_particles(Particle* particles, IMMState* state, double o, double h, double l, double c, double vol_factor, double range_factor);
 
 #endif

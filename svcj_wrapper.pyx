@@ -6,47 +6,48 @@ cimport numpy as np
 from libc.stdlib cimport malloc, free
 
 cdef extern from "svcj.h":
-    ctypedef struct PhysicsParams:
-        double kappa, theta, sigma_v, lambda_j, mu_j, sigma_j
     ctypedef struct Particle:
-        double v, mu, rho, weight
+        double v, mu, weight
+        int regime
     ctypedef struct IMMState:
-        double prob_bull, prob_bear, prob_neutral
-        double agg_vol, agg_drift, entropy
-        
-    void init_imm(PhysicsParams* phys, Particle* p, double start) nogil
-    void update_imm(Particle* p, PhysicsParams* phys, 
-                    double o, double h, double l, double c, 
-                    double vr, double df, double dt, 
-                    IMMState* out) nogil
+        double p_bull, p_bear, p_neutral, entropy
+        double kappa, theta, sigma_v, dt
 
-cdef class IMMFilter:
-    cdef PhysicsParams phys
-    cdef Particle* particles
-    cdef double dt_base
+    void init_particle_set(Particle* particles, double theta, double start_price) nogil
+    void update_particles(Particle* particles, IMMState* state, double o, double h, double l, double c, double vf, double rf) nogil
     
-    def __init__(self, dict params, double dt, double start):
-        self.phys.kappa = params.get('kappa', 4.0)
-        self.phys.theta = params.get('theta', 0.04)
-        self.phys.sigma_v = params.get('sigma_v', 0.5)
-        self.phys.lambda_j = 0.5
-        self.phys.mu_j = -0.05
-        self.phys.sigma_j = 0.05
+    int N_PARTICLES
+
+# The Stateful Class
+cdef class IMMFilter:
+    cdef Particle* particles
+    cdef IMMState state
+    
+    def __cinit__(self, dict physics, double dt, double start_price):
+        # Allocate memory for the particle swarm
+        self.particles = <Particle*> malloc(N_PARTICLES * sizeof(Particle))
+        if not self.particles:
+            raise MemoryError()
+            
+        # Set Physics
+        self.state.theta = physics['theta']
+        self.state.kappa = physics['kappa']
+        self.state.sigma_v = physics['sigma_v']
+        self.state.dt = dt
         
-        self.dt_base = dt
-        # 3000 particles total
-        self.particles = <Particle*> malloc(3000 * sizeof(Particle))
-        init_imm(&self.phys, self.particles, start)
+        # Initialize
+        init_particle_set(self.particles, self.state.theta, start_price)
         
     def __dealloc__(self):
-        if self.particles: free(self.particles)
+        # Clean up C memory
+        if self.particles:
+            free(self.particles)
             
-    def update(self, double o, double h, double l, double c, double vr, double df):
-        cdef IMMState out
-        with nogil:
-            update_imm(self.particles, &self.phys, o, h, l, c, vr, df, self.dt_base, &out)
-            
+    def update(self, double o, double h, double l, double c, double vol_factor, double range_factor):
+        # This function runs in microseconds. It just calls the C core.
+        update_particles(self.particles, &self.state, o, h, l, c, vol_factor, range_factor)
+        
         return {
-            "probs": [out.prob_bull, out.prob_bear, out.prob_neutral],
-            "entropy": out.entropy
+            "probs": [self.state.p_bull, self.state.p_bear, self.state.p_neutral],
+            "entropy": self.state.entropy
         }
