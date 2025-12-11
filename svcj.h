@@ -7,29 +7,29 @@
 #include <string.h>
 #include <stdint.h>
 
-#define N_PARTICLES 3000 // Increased for 3 sub-swarms
-#define MIN_EFFECTIVE_PARTICLES 1500
+// 3 Swarms x 1000 Particles
+#define N_SUB_PARTICLES 1000
+#define N_TOTAL (N_SUB_PARTICLES * 3)
 
 typedef struct {
-    double v;           // Variance
-    double mu;          // Drift
-    double rho;         // Correlation
-    double weight;      // Probability
-    double last_log_p;  // Memory
-    int regime;         // 1=Bull, -1=Bear, 0=Neutral
+    double v;
+    double mu;
+    double rho;
+    double weight;
+    double last_log_p;
 } Particle;
 
 typedef struct {
-    double mode_vol;
-    double entropy;
-    
-    // Regime Probabilities (The Clean Signal)
+    // Regime Probabilities (The Signal)
     double prob_bull;
     double prob_bear;
     double prob_neutral;
     
-    int collapsed;
-} SwarmState;
+    // Physics State (Weighted Average)
+    double agg_vol;
+    double agg_drift;
+    double entropy;
+} IMMState;
 
 typedef struct {
     double kappa;
@@ -40,10 +40,10 @@ typedef struct {
     double sigma_j;
 } PhysicsParams;
 
-void init_swarm(PhysicsParams* phys, Particle* swarm, double start_price);
-void update_swarm_regime(Particle* swarm, PhysicsParams* phys, 
-                         double o, double h, double l, double c, 
-                         double vol_ratio, double diurnal_factor, double dt, 
-                         SwarmState* out);
+void init_imm(PhysicsParams* phys, Particle* particles, double start_price);
+void update_imm(Particle* particles, PhysicsParams* phys, 
+                double o, double h, double l, double c, 
+                double vol_ratio, double diurnal_factor, double dt, 
+                IMMState* out);
 
 #endif

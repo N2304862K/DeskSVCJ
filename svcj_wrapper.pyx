@@ -10,49 +10,43 @@ cdef extern from "svcj.h":
         double kappa, theta, sigma_v, lambda_j, mu_j, sigma_j
     ctypedef struct Particle:
         double v, mu, rho, weight
-    ctypedef struct SwarmState:
-        double mode_vol, entropy
+    ctypedef struct IMMState:
         double prob_bull, prob_bear, prob_neutral
-        int collapsed
+        double agg_vol, agg_drift, entropy
         
-    void init_swarm(PhysicsParams* phys, Particle* swarm, double start_price) nogil
-    void update_swarm_regime(Particle* swarm, PhysicsParams* phys, 
-                             double o, double h, double l, double c, 
-                             double vol_ratio, double diurnal_factor, double dt, 
-                             SwarmState* out) nogil
+    void init_imm(PhysicsParams* phys, Particle* p, double start) nogil
+    void update_imm(Particle* p, PhysicsParams* phys, 
+                    double o, double h, double l, double c, 
+                    double vr, double df, double dt, 
+                    IMMState* out) nogil
 
-cdef class IntradaySwarm:
+cdef class IMMFilter:
     cdef PhysicsParams phys
-    cdef Particle* swarm
+    cdef Particle* particles
     cdef double dt_base
     
-    def __init__(self, dict params, double dt_base, double start_price):
+    def __init__(self, dict params, double dt, double start):
         self.phys.kappa = params.get('kappa', 4.0)
         self.phys.theta = params.get('theta', 0.04)
         self.phys.sigma_v = params.get('sigma_v', 0.5)
-        self.phys.lambda_j = params.get('lambda_j', 0.5)
-        self.phys.mu_j = params.get('mu_j', -0.05)
-        self.phys.sigma_j = params.get('sigma_j', 0.05)
+        self.phys.lambda_j = 0.5
+        self.phys.mu_j = -0.05
+        self.phys.sigma_j = 0.05
         
-        self.dt_base = dt_base
-        self.swarm = <Particle*> malloc(3000 * sizeof(Particle))
-        init_swarm(&self.phys, self.swarm, start_price)
+        self.dt_base = dt
+        # 3000 particles total
+        self.particles = <Particle*> malloc(3000 * sizeof(Particle))
+        init_imm(&self.phys, self.particles, start)
         
     def __dealloc__(self):
-        if self.swarm: free(self.swarm)
+        if self.particles: free(self.particles)
             
-    def update_tick(self, double o, double h, double l, double c, double v_ratio, double d_factor):
-        cdef SwarmState out
+    def update(self, double o, double h, double l, double c, double vr, double df):
+        cdef IMMState out
         with nogil:
-            update_swarm_regime(self.swarm, &self.phys, o, h, l, c, v_ratio, d_factor, self.dt_base, &out)
+            update_imm(self.particles, &self.phys, o, h, l, c, vr, df, self.dt_base, &out)
             
         return {
-            "mode_vol": out.mode_vol,
-            "entropy": out.entropy,
-            "probs": {
-                "bull": out.prob_bull,
-                "bear": out.prob_bear,
-                "neutral": out.prob_neutral
-            },
-            "collapsed": bool(out.collapsed)
+            "probs": [out.prob_bull, out.prob_bear, out.prob_neutral],
+            "entropy": out.entropy
         }
