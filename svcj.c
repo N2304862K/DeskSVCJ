@@ -4,7 +4,7 @@
 // --- RNG ---
 double norm_rand() {
     double u1 = (double)rand() / RAND_MAX;
-    if (u1 < 1e-9) u1 = 1e-9; // Safety
+    if(u1 < 1e-9) u1 = 1e-9;
     double u2 = (double)rand() / RAND_MAX;
     return sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
 }
@@ -16,8 +16,7 @@ void compute_log_returns(double* ohlcv, int n, double* out) {
 }
 
 void generate_prior_swarm(double* ohlcv, int n, double dt, Particle* out) {
-    srand(time(NULL)); // Seed RNG
-    
+    srand(time(NULL));
     double sum_sq=0; for(int i=1; i<n; i++) { 
         double r=log(ohlcv[i*N_COLS+3]/ohlcv[(i-1)*N_COLS+3]); sum_sq+=r*r; 
     }
@@ -65,7 +64,6 @@ void run_particle_filter_step(Particle* sw, double ret, double dt, FilterStats* 
     out->ess = 1.0/sum_sq;
     out->entropy = entropy;
     
-    // Resample
     if(out->ess < SWARM_SIZE/4) {
         Particle* nw = malloc(SWARM_SIZE*sizeof(Particle));
         double c=0, u=((double)rand()/RAND_MAX)/SWARM_SIZE; int k=0;
@@ -78,8 +76,8 @@ void run_particle_filter_step(Particle* sw, double ret, double dt, FilterStats* 
     }
 }
 
-void run_contrastive_simulation(Particle* swarm, double price, double dt, MarketMicrostructure micro, ContrastiveResult* out) {
-    // 1. Select Scenarios
+// --- CONTRASTIVE ENGINE WITH MOMENTUM ---
+void run_contrastive_simulation(Particle* swarm, double price, double current_z, double dt, MarketMicrostructure micro, ContrastiveResult* out) {
     Particle scenarios[SIM_SCENARIOS];
     double u = ((double)rand()/RAND_MAX)/SIM_SCENARIOS; double c=0; int k=0;
     for(int i=0; i<SIM_SCENARIOS; i++) {
@@ -97,6 +95,12 @@ void run_contrastive_simulation(Particle* swarm, double price, double dt, Market
         double cost = price * (micro.spread_bps + micro.impact_coef * current_vol);
         s_fric += cost;
         
+        // MOMENTUM INJECTION:
+        // Z-Score is essentially "Standard Deviations of Velocity".
+        // We convert Z to an initial drift rate.
+        // If Z=2.0, market is moving 2 sigma/dt.
+        double momentum_drift_annual = current_z * current_vol; 
+        
         double stop_dist = micro.stop_sigma * current_vol * sqrt(dt) * price;
         
         for(int n=0; n<PATHS_PER_SCENARIO; n++) {
@@ -113,9 +117,14 @@ void run_contrastive_simulation(Particle* swarm, double price, double dt, Market
                 double jump = 0;
                 if( ((double)rand()/RAND_MAX) < p.lambda_j*dt ) jump = -0.05 + 0.1*norm_rand();
                 
-                p_curr *= (1.0 + sqrt(v_curr*dt)*dW + jump);
+                // DECAYING MOMENTUM:
+                // Drift isn't permanent. It decays based on Mean Reversion (Kappa).
+                double current_drift = momentum_drift_annual * exp(-p.kappa * t * dt);
                 
-                // Decay
+                // SDE with Drift Bias
+                p_curr *= (1.0 + (current_drift * dt) + sqrt(v_curr*dt)*dW + jump);
+                
+                // Cone of Silence (Target Decay)
                 double decay_factor = exp(-micro.decay_rate * t);
                 double target_dist = micro.target_sigma_init * decay_factor * current_vol * sqrt(dt) * price;
                 

@@ -36,6 +36,15 @@ typedef struct {
 void compute_log_returns(double* ohlcv, int n, double* out);
 void generate_prior_swarm(double* ohlcv, int n, double dt, Particle* out);
 void run_particle_filter_step(Particle* sw, double ret, double dt, FilterStats* out);
-void run_contrastive_simulation(Particle* sw, double p, double dt, MarketMicrostructure m, ContrastiveResult* r);
+
+// Updated: Accepts current_z to bias the paths
+void run_contrastive_simulation(
+    Particle* sw, 
+    double price, 
+    double current_z, 
+    double dt, 
+    MarketMicrostructure m, 
+    ContrastiveResult* r
+);
 
 #endif
