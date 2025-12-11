@@ -9,11 +9,11 @@
 
 #define N_PARTICLES 2000
 #define MIN_EFFECTIVE_PARTICLES 1000
-#define CHI_SQ_CUTOFF 9.0
+#define ADAPTIVE_LEARNING_RATE 20.0 // Aggressiveness of Drift Learning
 
 typedef struct {
     double v;           // Variance
-    double mu;          // Drift
+    double mu;          // Drift (Velocity)
     double rho;         // Correlation
     double weight;      // Probability
     double last_log_p;  // Memory
@@ -25,7 +25,6 @@ typedef struct {
     double ev_drift;
     double entropy;
     int collapsed;
-    double final_temperature; // Diagnostic: How hard did we have to crush it?
 } SwarmState;
 
 typedef struct {
@@ -38,9 +37,9 @@ typedef struct {
 } PhysicsParams;
 
 void init_swarm(PhysicsParams* phys, Particle* swarm, double start_price);
-void update_swarm(Particle* swarm, PhysicsParams* phys, 
-                  double o, double h, double l, double c, 
-                  double vol_ratio, double diurnal_factor, double macro_momentum, double dt, 
-                  SwarmState* out);
+void update_swarm_learning(Particle* swarm, PhysicsParams* phys, 
+                           double o, double h, double l, double c, 
+                           double vol_ratio, double diurnal_factor, double dt, 
+                           SwarmState* out);
 
 #endif
