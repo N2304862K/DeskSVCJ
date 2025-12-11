@@ -12,7 +12,7 @@ cdef extern from "svcj.h":
         double v, mu, rho, weight
     ctypedef struct SwarmState:
         double ev_vol, mode_vol, ev_drift, entropy
-        int collapse_count
+        int collapsed
         
     void init_swarm(PhysicsParams* phys, Particle* swarm, double start_price) nogil
     void update_swarm(Particle* swarm, PhysicsParams* phys, 
@@ -50,5 +50,5 @@ cdef class IntradaySwarm:
             "mode_vol": out.mode_vol,
             "ev_drift": out.ev_drift,
             "entropy": out.entropy,
-            "collapsed": bool(out.collapse_count)
+            "collapsed": bool(out.collapsed)
         }

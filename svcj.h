@@ -9,6 +9,7 @@
 
 #define N_PARTICLES 2000
 #define MIN_EFFECTIVE_PARTICLES 1000
+#define CHI_SQ_CUTOFF 9.0 // 3-Sigma event threshold (Mahalanobis Distance)
 
 typedef struct {
     double v;           // Variance
@@ -23,7 +24,7 @@ typedef struct {
     double mode_vol;
     double ev_drift;
     double entropy;
-    int collapse_count; // Debug: Track if swarm died
+    int collapsed;
 } SwarmState;
 
 typedef struct {
