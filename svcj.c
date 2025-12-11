@@ -22,9 +22,9 @@ double rand_normal() {
 void init_swarm(PhysicsParams* phys, Particle* swarm, double start_price) {
     double log_p = log(start_price);
     for(int i=0; i<N_PARTICLES; i++) {
-        swarm[i].v = phys->theta * (0.9 + 0.2 * ((next_rand()%1000)/1000.0));
+        swarm[i].v = phys->theta; 
         swarm[i].mu = 0.0;
-        swarm[i].rho = -0.5 + 0.1 * rand_normal(); 
+        swarm[i].rho = -0.5;
         swarm[i].weight = 1.0 / N_PARTICLES;
         swarm[i].last_log_p = log_p;
     }
@@ -37,7 +37,6 @@ double calc_range_likelihood(double h, double l, double v, double dt) {
     double diff = range - expected;
     double var_est = safe_v * dt * 0.5; 
     if(var_est < 1e-12) var_est = 1e-12;
-    
     double m_dist = (diff*diff) / var_est;
     if (m_dist > 16.0) return 1e-15; 
     return exp(-1.0 * m_dist);
@@ -58,6 +57,12 @@ void update_swarm(Particle* swarm, PhysicsParams* phys,
     double dt_eff = dt * vol_ratio;
     double theta_eff = phys->theta * diurnal_factor;
 
+    // --- ADAPTIVE LOGIC ---
+    // If previous entropy was high, we need more aggression
+    // We infer "confusion" from the effective sample size of the previous step
+    // But since we don't pass prev_entropy, we use a high base contrast
+    double contrast_power = 8.0; 
+
     // --- A. PROPAGATE ---
     for(int i=0; i<N_PARTICLES; i++) {
         Particle* p = &swarm[i];
@@ -68,13 +73,14 @@ void update_swarm(Particle* swarm, PhysicsParams* phys,
         // Variance (Heston)
         p->v += phys->kappa * (theta_eff - p->v) * dt_eff + phys->sigma_v * sqrt(p->v) * dw_v * sqrt(dt_eff);
         if(p->v < 1e-6) p->v = 1e-6;
-        if(p->v > 10.0) p->v = 10.0;
+        if(p->v > 20.0) p->v = 20.0;
         
         // Drift (Random Walk)
-        p->mu += 0.2 * sqrt(p->v) * dw_drift * sqrt(dt_eff);
-        if(p->mu > 10.0) p->mu = 10.0; if(p->mu < -10.0) p->mu = -10.0;
+        // INCREASED NOISE (0.2 -> 0.5) to allow catching fast moves
+        p->mu += 0.5 * sqrt(p->v) * dw_drift * sqrt(dt_eff);
+        if(p->mu > 20.0) p->mu = 20.0; 
+        if(p->mu < -20.0) p->mu = -20.0;
         
-        // Jump
         int is_jump = 0;
         if ((next_rand()%10000)/10000.0 < (phys->lambda_j * dt_eff)) is_jump = 1;
         
@@ -87,7 +93,7 @@ void update_swarm(Particle* swarm, PhysicsParams* phys,
         double m_dist = (innov * innov) / var_tot;
         
         double like_ret = 0.0;
-        if (m_dist > 9.0) {
+        if (m_dist > 16.0) { // Widened gate (4-sigma) to prevent premature killing
             like_ret = 1e-20; 
         } else {
             like_ret = (1.0/sqrt(2*M_PI*var_tot)) * exp(-0.5 * m_dist);
@@ -96,14 +102,11 @@ void update_swarm(Particle* swarm, PhysicsParams* phys,
         double like_rng = calc_range_likelihood(h, l, p->v, dt_eff);
         double raw_w = like_ret * like_rng;
         
-        // --- C. CONTRAST BOOST (Aggressive) ---
-        // Power 4.0 forces the swarm to kill weak particles 
-        // and crystallize on the leader. This reduces Entropy.
-        p->weight *= pow(raw_w, 4.0); 
+        // --- C. CONTRAST BOOST ---
+        p->weight *= pow(raw_w, contrast_power); 
         
         p->last_log_p = log_c;
         if(p->weight < 1e-150) p->weight = 1e-150;
-        
         sum_weight += p->weight;
     }
     
@@ -127,7 +130,7 @@ void update_swarm(Particle* swarm, PhysicsParams* phys,
     
     #define BINS 50
     double bins[BINS] = {0};
-    double max_v = theta_eff * 5.0;
+    double max_v = theta_eff * 8.0;
     
     for(int i=0; i<N_PARTICLES; i++) {
         swarm[i].weight /= sum_weight;
@@ -135,7 +138,6 @@ void update_swarm(Particle* swarm, PhysicsParams* phys,
         sum_sq_weight += w*w;
         
         if(w > 1e-12) entropy -= w * log(w);
-        
         out->ev_vol += w * sqrt(swarm[i].v);
         out->ev_drift += w * swarm[i].mu;
         
@@ -143,14 +145,14 @@ void update_swarm(Particle* swarm, PhysicsParams* phys,
         if(b >= BINS) b = BINS-1;
         bins[b] += w;
     }
-    
     out->entropy = entropy / log(N_PARTICLES);
     
     int best_b = 0;
     for(int i=1; i<BINS; i++) if(bins[i] > bins[best_b]) best_b = i;
     out->mode_vol = sqrt(((double)best_b/BINS)*max_v + (0.5/BINS)*max_v);
     
-    // --- F. RESAMPLE (Low Jitter) ---
+    // --- F. RESAMPLE (ADAPTIVE JITTER) ---
+    // Only resample if N_eff is critical (< 50%)
     if(1.0/sum_sq_weight < (N_PARTICLES * 0.5)) {
         Particle* new_s = malloc(N_PARTICLES * sizeof(Particle));
         double r = (next_rand()%10000)/10000.0 * (1.0/N_PARTICLES);
@@ -164,8 +166,13 @@ void update_swarm(Particle* swarm, PhysicsParams* phys,
             new_s[m] = swarm[i];
             new_s[m].weight = 1.0/N_PARTICLES;
             
-            new_s[m].v *= (0.995 + 0.01 * ((next_rand()%1000)/1000.0));
-            new_s[m].mu += 0.01 * rand_normal(); 
+            // ADAPTIVE JITTER
+            // If Entropy is Low (Crystallized), we allow more jitter to explore.
+            // If Entropy is High (Confused), we reduce jitter to force convergence.
+            double jitter_scale = (out->entropy < 0.5) ? 0.02 : 0.001;
+            
+            new_s[m].v *= (1.0 + jitter_scale * rand_normal());
+            new_s[m].mu += jitter_scale * rand_normal();
             new_s[m].rho = swarm[i].rho;
         }
         memcpy(swarm, new_s, N_PARTICLES * sizeof(Particle));
