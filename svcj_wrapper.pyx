@@ -5,78 +5,66 @@ import numpy as np
 cimport numpy as np
 from libc.stdlib cimport malloc, free
 
-cdef extern from "svcj_swarm.h":
-    # Structs must match C header exactly
+cdef extern from "svcj.h":
+    int N_PARTICLES
+    
+    ctypedef struct PhysicsParams:
+        double kappa, theta, sigma_v, lambda_j, mu_j, sigma_j
+    
     ctypedef struct Particle:
-        double v, mu, rho
-        int jump_state
-        double weight
+        double v, mu, rho, weight
         
-    ctypedef struct SwarmParams:
-        double kappa, theta, sigma_v, rho_mean, lambda_j, mu_j, sigma_j
+    ctypedef struct SwarmState:
+        double ev_vol, mode_vol, ev_drift, entropy
         
-    ctypedef struct SwarmMetrics:
-        double expected_return, risk_volatility, swarm_entropy, regime_prob, effective_rho
-    
-    void init_swarm(Particle* swarm, SwarmParams* p) nogil
-    void predict_step(Particle* swarm, SwarmParams* p, double dt, double diurnal) nogil
-    void update_step(Particle* swarm, SwarmParams* p, double ret, double rng, double dt) nogil
-    void resample_regularized(Particle* swarm, SwarmParams* p) nogil
-    void calc_swarm_metrics(Particle* swarm, SwarmMetrics* out) nogil
+    void init_swarm(PhysicsParams* phys, Particle* swarm, double start_price) nogil
+    void update_swarm(Particle* swarm, PhysicsParams* phys, 
+                      double o, double h, double l, double c, 
+                      double vol_ratio, double diurnal_factor, double dt, 
+                      SwarmState* out) nogil
 
-cdef class SwarmEngine:
-    cdef Particle* particles
-    cdef SwarmParams params
-    cdef double dt
-    cdef int n_particles
+cdef class IntradaySwarm:
+    cdef PhysicsParams phys
+    cdef Particle* swarm
+    cdef double dt_base
     
-    def __init__(self, dict physics, double dt):
-        self.n_particles = 2000
-        self.particles = <Particle*> malloc(self.n_particles * sizeof(Particle))
-        self.dt = dt
+    def __init__(self, dict params, double dt_base, double start_price):
+        self.phys.kappa = params.get('kappa', 4.0)
+        self.phys.theta = params.get('theta', 0.04)
+        self.phys.sigma_v = params.get('sigma_v', 0.3)
+        self.phys.lambda_j = params.get('lambda_j', 0.5)
+        self.phys.mu_j = params.get('mu_j', -0.05)
+        self.phys.sigma_j = params.get('sigma_j', 0.05)
         
-        # Load Physics
-        self.params.kappa = physics['kappa']
-        self.params.theta = physics['theta']
-        self.params.sigma_v = physics['sigma_v']
-        self.params.rho_mean = physics['rho']
-        self.params.lambda_j = physics['lambda_j']
-        self.params.mu_j = -0.05 # Default downside skew for jumps
-        self.params.sigma_j = 0.05
+        self.dt_base = dt_base
         
-        # Init
-        with nogil:
-            init_swarm(self.particles, &self.params)
-            
+        # Allocate Swarm Memory
+        self.swarm = <Particle*> malloc(N_PARTICLES * sizeof(Particle))
+        
+        # Initialize
+        init_swarm(&self.phys, self.swarm, start_price)
+        
     def __dealloc__(self):
-        free(self.particles)
-        
-    def update(self, double ret, double range_sq, double diurnal_factor):
+        if self.swarm:
+            free(self.swarm)
+            
+    def update_tick(self, double o, double h, double l, double c, double vol_ratio, double diurnal_factor):
         """
-        Steps the Swarm forward 1 tick.
-        ret: Log Return (Close-to-Close)
-        range_sq: (High-Low)^2 / Close^2 (Parkinson Vol Proxy)
-        diurnal_factor: 1.0 = Average, 2.0 = Open/Close, 0.5 = Lunch
+        Feeds the swarm a new bar.
+        vol_ratio: CurrentVol / AvgVol (Volume Clock)
+        diurnal_factor: Expected Intraday Vol Multiplier (Seasonality)
         """
-        cdef SwarmMetrics m
+        cdef SwarmState out
         
         with nogil:
-            # 1. Predict (Drift & Diffuse)
-            predict_step(self.particles, &self.params, self.dt, diurnal_factor)
-            
-            # 2. Update (Weight by Evidence)
-            update_step(self.particles, &self.params, ret, range_sq, self.dt)
-            
-            # 3. Resample (Survival of fittest)
-            resample_regularized(self.particles, &self.params)
-            
-            # 4. Measure
-            calc_swarm_metrics(self.particles, &m)
+            update_swarm(self.swarm, &self.phys, 
+                         o, h, l, c, 
+                         vol_ratio, diurnal_factor, self.dt_base, 
+                         &out)
             
         return {
-            "ev_drift": m.expected_return,
-            "risk_vol": m.risk_volatility,
-            "entropy": m.swarm_entropy,
-            "jump_prob": m.regime_prob,
-            "rho": m.effective_rho
+            "ev_vol": out.ev_vol,       # Mean (Risk)
+            "mode_vol": out.mode_vol,   # Mode (Robust State)
+            "ev_drift": out.ev_drift,   # Trend Strength
+            "entropy": out.entropy      # Confidence (Low = Action)
         }

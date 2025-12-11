@@ -1,54 +1,52 @@
-#ifndef SVCJ_SWARM_H
-#define SVCJ_SWARM_H
+#ifndef SVCJ_H
+#define SVCJ_H
 
 #include <math.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <time.h>
+#include <stdint.h>
 
 #define N_PARTICLES 2000
-#define MIN_ particles 100
-#define SQRT_2PI 2.50662827463
+#define MIN_EFFECTIVE_PARTICLES 1000
+#define DT_BASE (1.0/(252.0*78.0)) // 5-minute bars default
 
-// The Hypothesis Unit
+// The Hypothesis (Particle)
 typedef struct {
     double v;           // Spot Variance
     double mu;          // Instantaneous Drift (Trend)
-    double rho;         // Stochastic Correlation
-    int jump_state;     // 1 = Jump Regime, 0 = Diffusion
+    double rho;         // Correlation (Stochastic)
     double weight;      // Probability of this hypothesis
+    double last_log_p;  // For likelihood calc
 } Particle;
 
-// Hyperparameters (The Rules of the Game)
+// The Consensus (Swarm Output)
+typedef struct {
+    double ev_vol;      // Expected Value (Mean) Volatility
+    double mode_vol;    // Most Probable Volatility (Robust)
+    double ev_drift;    // Expected Trend
+    double entropy;     // Swarm Confusion (Action Blurring)
+    double jump_prob;   // Probability of Jump State
+    
+    // Limits
+    double vol_99;      // 99th Percentile Vol (Risk Limit)
+} SwarmState;
+
+// Static Physics (The "Rules")
 typedef struct {
     double kappa;
-    double theta;       // Long Run Variance
-    double sigma_v;     // Vol of Vol
-    double lambda_j;    // Jump Intensity
-    double mu_j;        // Jump Mean
-    double sigma_j;     // Jump Std
-    double rho_mean;    // Mean Reversion for Correlation
-} SwarmParams;
-
-// The Decision Payload
-typedef struct {
-    double expected_return;  // Weighted Mean Drift (EV Direction)
-    double risk_volatility;  // 95th Percentile Vol (EV Cost)
-    double swarm_entropy;    // Confusion Metric (Action Blurring)
-    double regime_prob;      // Probability of Jump/Trend Regime
-    double effective_rho;    // Consensus Correlation
-} SwarmMetrics;
+    double theta;
+    double sigma_v;
+    double lambda_j;
+    double mu_j;
+    double sigma_j;
+} PhysicsParams;
 
 // Core Functions
-void init_swarm(Particle* swarm, SwarmParams* p);
-void predict_step(Particle* swarm, SwarmParams* p, double dt, double diurnal_factor);
-void update_step(Particle* swarm, SwarmParams* p, double ret, double range_sq, double dt);
-void resample_regularized(Particle* swarm, SwarmParams* p);
-void calc_swarm_metrics(Particle* swarm, SwarmMetrics* out);
-
-// Helpers
-double get_random_normal();
-double get_random_uniform();
+void init_swarm(PhysicsParams* phys, Particle* swarm, double start_price);
+void update_swarm(Particle* swarm, PhysicsParams* phys, 
+                  double open, double high, double low, double close, 
+                  double vol_ratio, double diurnal_factor, double dt, 
+                  SwarmState* out_state);
 
 #endif
