@@ -39,7 +39,8 @@ typedef struct {
 void init_swarm(PhysicsParams* phys, Particle* swarm, double start_price);
 void update_swarm(Particle* swarm, PhysicsParams* phys, 
                   double o, double h, double l, double c, 
-                  double vol_ratio, double diurnal_factor, double momentum_bias, double dt, 
+                  double vol_ratio, double diurnal_factor, double dt,
+                  double context_drift, double context_conf, // NEW INPUTS
                   SwarmState* out);
 
 #endif
