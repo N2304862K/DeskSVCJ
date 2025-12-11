@@ -6,14 +6,10 @@ cimport numpy as np
 from libc.stdlib cimport malloc, free
 
 cdef extern from "svcj.h":
-    int N_PARTICLES
-    
     ctypedef struct PhysicsParams:
         double kappa, theta, sigma_v, lambda_j, mu_j, sigma_j
-    
     ctypedef struct Particle:
         double v, mu, rho, weight
-        
     ctypedef struct SwarmState:
         double ev_vol, mode_vol, ev_drift, entropy
         
@@ -31,40 +27,27 @@ cdef class IntradaySwarm:
     def __init__(self, dict params, double dt_base, double start_price):
         self.phys.kappa = params.get('kappa', 4.0)
         self.phys.theta = params.get('theta', 0.04)
-        self.phys.sigma_v = params.get('sigma_v', 0.3)
+        self.phys.sigma_v = params.get('sigma_v', 0.5)
         self.phys.lambda_j = params.get('lambda_j', 0.5)
         self.phys.mu_j = params.get('mu_j', -0.05)
         self.phys.sigma_j = params.get('sigma_j', 0.05)
         
         self.dt_base = dt_base
+        self.swarm = <Particle*> malloc(2000 * sizeof(Particle)) # Match N_PARTICLES
         
-        # Allocate Swarm Memory
-        self.swarm = <Particle*> malloc(N_PARTICLES * sizeof(Particle))
-        
-        # Initialize
         init_swarm(&self.phys, self.swarm, start_price)
         
     def __dealloc__(self):
-        if self.swarm:
-            free(self.swarm)
+        if self.swarm: free(self.swarm)
             
-    def update_tick(self, double o, double h, double l, double c, double vol_ratio, double diurnal_factor):
-        """
-        Feeds the swarm a new bar.
-        vol_ratio: CurrentVol / AvgVol (Volume Clock)
-        diurnal_factor: Expected Intraday Vol Multiplier (Seasonality)
-        """
+    def update_tick(self, double o, double h, double l, double c, double v_ratio, double d_factor):
         cdef SwarmState out
-        
         with nogil:
-            update_swarm(self.swarm, &self.phys, 
-                         o, h, l, c, 
-                         vol_ratio, diurnal_factor, self.dt_base, 
-                         &out)
+            update_swarm(self.swarm, &self.phys, o, h, l, c, v_ratio, d_factor, self.dt_base, &out)
             
         return {
-            "ev_vol": out.ev_vol,       # Mean (Risk)
-            "mode_vol": out.mode_vol,   # Mode (Robust State)
-            "ev_drift": out.ev_drift,   # Trend Strength
-            "entropy": out.entropy      # Confidence (Low = Action)
+            "ev_vol": out.ev_vol,
+            "mode_vol": out.mode_vol,
+            "ev_drift": out.ev_drift,
+            "entropy": out.entropy
         }

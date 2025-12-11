@@ -9,30 +9,25 @@
 
 #define N_PARTICLES 2000
 #define MIN_EFFECTIVE_PARTICLES 1000
-#define DT_BASE (1.0/(252.0*78.0)) // 5-minute bars default
 
-// The Hypothesis (Particle)
+// The Particle (Hypothesis)
 typedef struct {
-    double v;           // Spot Variance
-    double mu;          // Instantaneous Drift (Trend)
-    double rho;         // Correlation (Stochastic)
-    double weight;      // Probability of this hypothesis
-    double last_log_p;  // For likelihood calc
+    double v;           // Variance
+    double mu;          // Drift (Trend)
+    double rho;         // Correlation
+    double weight;      // Likelihood
+    double last_log_p;  // Memory
 } Particle;
 
-// The Consensus (Swarm Output)
+// The Consensus (Output)
 typedef struct {
-    double ev_vol;      // Expected Value (Mean) Volatility
-    double mode_vol;    // Most Probable Volatility (Robust)
+    double ev_vol;      // Mean Vol (Risk)
+    double mode_vol;    // Robust Vol (Signal)
     double ev_drift;    // Expected Trend
-    double entropy;     // Swarm Confusion (Action Blurring)
-    double jump_prob;   // Probability of Jump State
-    
-    // Limits
-    double vol_99;      // 99th Percentile Vol (Risk Limit)
+    double entropy;     // Confidence
 } SwarmState;
 
-// Static Physics (The "Rules")
+// Physics Limits
 typedef struct {
     double kappa;
     double theta;
@@ -42,11 +37,10 @@ typedef struct {
     double sigma_j;
 } PhysicsParams;
 
-// Core Functions
 void init_swarm(PhysicsParams* phys, Particle* swarm, double start_price);
 void update_swarm(Particle* swarm, PhysicsParams* phys, 
-                  double open, double high, double low, double close, 
+                  double o, double h, double l, double c, 
                   double vol_ratio, double diurnal_factor, double dt, 
-                  SwarmState* out_state);
+                  SwarmState* out);
 
 #endif
