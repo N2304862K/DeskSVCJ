@@ -1,5 +1,5 @@
-#ifndef SVCJ_H
-#define SVCJ_H
+#ifndef SVCJ_SWARM_H
+#define SVCJ_SWARM_H
 
 #include <math.h>
 #include <stdlib.h>
@@ -7,45 +7,48 @@
 #include <string.h>
 #include <time.h>
 
-#define SWARM_SIZE 5000
-#define SIM_SCENARIOS 50
-#define PATHS_PER_SCENARIO 200
-#define N_COLS 5
+#define N_PARTICLES 2000
+#define MIN_ particles 100
+#define SQRT_2PI 2.50662827463
 
+// The Hypothesis Unit
 typedef struct {
-    double kappa, theta, sigma_v, rho, lambda_j, mu_j, sigma_j;
-    double v; 
-    double weight;
+    double v;           // Spot Variance
+    double mu;          // Instantaneous Drift (Trend)
+    double rho;         // Stochastic Correlation
+    int jump_state;     // 1 = Jump Regime, 0 = Diffusion
+    double weight;      // Probability of this hypothesis
 } Particle;
 
+// Hyperparameters (The Rules of the Game)
 typedef struct {
-    double spot_vol_mean, innovation_z, ess, entropy;
-} FilterStats;
+    double kappa;
+    double theta;       // Long Run Variance
+    double sigma_v;     // Vol of Vol
+    double lambda_j;    // Jump Intensity
+    double mu_j;        // Jump Mean
+    double sigma_j;     // Jump Std
+    double rho_mean;    // Mean Reversion for Correlation
+} SwarmParams;
 
+// The Decision Payload
 typedef struct {
-    double spread_bps, impact_coef, stop_sigma, target_sigma_init, decay_rate;
-    int horizon;
-} MarketMicrostructure;
+    double expected_return;  // Weighted Mean Drift (EV Direction)
+    double risk_volatility;  // 95th Percentile Vol (EV Cost)
+    double swarm_entropy;    // Confusion Metric (Action Blurring)
+    double regime_prob;      // Probability of Jump/Trend Regime
+    double effective_rho;    // Consensus Correlation
+} SwarmMetrics;
 
-typedef struct {
-    double alpha_long, alpha_short;
-    double t_stat_long, t_stat_short;
-    double cohens_d;
-    double friction_cost_avg;
-} ContrastiveResult;
+// Core Functions
+void init_swarm(Particle* swarm, SwarmParams* p);
+void predict_step(Particle* swarm, SwarmParams* p, double dt, double diurnal_factor);
+void update_step(Particle* swarm, SwarmParams* p, double ret, double range_sq, double dt);
+void resample_regularized(Particle* swarm, SwarmParams* p);
+void calc_swarm_metrics(Particle* swarm, SwarmMetrics* out);
 
-void compute_log_returns(double* ohlcv, int n, double* out);
-void generate_prior_swarm(double* ohlcv, int n, double dt, Particle* out);
-void run_particle_filter_step(Particle* sw, double ret, double dt, FilterStats* out);
-
-// The Asymmetric Engine
-void run_asymmetric_simulation(
-    Particle* sw, 
-    double price, 
-    double z_score, 
-    double dt, 
-    MarketMicrostructure m, 
-    ContrastiveResult* r
-);
+// Helpers
+double get_random_normal();
+double get_random_uniform();
 
 #endif

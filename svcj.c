@@ -1,179 +1,176 @@
-#include "svcj.h"
-#include <float.h>
+#include "svcj_swarm.h"
 
-// --- RNG ---
-double norm_rand() {
-    double u1 = (double)rand() / RAND_MAX;
-    if (u1 < 1e-9) u1 = 1e-9;
-    double u2 = (double)rand() / RAND_MAX;
-    return sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
+// --- RNG Helpers ---
+// Simple Box-Muller for speed/portability
+double get_random_normal() {
+    double u = ((double)rand() / RAND_MAX);
+    double v = ((double)rand() / RAND_MAX);
+    return sqrt(-2.0 * log(u)) * cos(2.0 * M_PI * v);
 }
-double lognorm_rand(double mu, double std) { return exp(mu + std*norm_rand()); }
+double get_random_uniform() { return ((double)rand() / RAND_MAX); }
 
-// --- Standard Filter Logic ---
-void compute_log_returns(double* ohlcv, int n, double* out) {
-    for(int i=1; i<n; i++) out[i-1] = log(ohlcv[i*N_COLS+3]/ohlcv[(i-1)*N_COLS+3]);
-}
-
-void generate_prior_swarm(double* ohlcv, int n, double dt, Particle* out) {
-    srand(time(NULL));
-    double sum_sq=0; for(int i=1; i<n; i++) { 
-        double r=log(ohlcv[i*N_COLS+3]/ohlcv[(i-1)*N_COLS+3]); sum_sq+=r*r; 
-    }
-    double rv = (sum_sq/(n-1))/dt;
-    
-    for(int i=0; i<SWARM_SIZE; i++) {
-        out[i].theta = lognorm_rand(log(rv), 0.5);
-        out[i].kappa = lognorm_rand(log(3.0), 0.5);
-        out[i].sigma_v = lognorm_rand(log(0.5), 0.5);
-        out[i].rho = -0.5 + 0.2*norm_rand();
-        out[i].lambda_j = lognorm_rand(log(0.5), 0.5);
-        out[i].mu_j = 0.0; out[i].sigma_j = sqrt(rv);
-        out[i].v = out[i].theta; out[i].weight = 1.0/SWARM_SIZE;
+// --- Initialization ---
+void init_swarm(Particle* swarm, SwarmParams* p) {
+    for(int i=0; i<N_PARTICLES; i++) {
+        swarm[i].v = p->theta;
+        swarm[i].mu = 0.0;
+        swarm[i].rho = p->rho_mean + 0.1 * get_random_normal(); // Jittered Correlation
+        if(swarm[i].rho > 0.99) swarm[i].rho = 0.99;
+        if(swarm[i].rho < -0.99) swarm[i].rho = -0.99;
+        
+        swarm[i].jump_state = 0;
+        swarm[i].weight = 1.0 / N_PARTICLES;
     }
 }
 
-void run_particle_filter_step(Particle* sw, double ret, double dt, FilterStats* out) {
-    double sum_w=0, sum_sq=0, m_v=0, m_z=0;
+// --- Step 1: Predict (Evolution) ---
+// Solves "Diurnal Seasonality" by scaling drift/diffusion with time-of-day
+void predict_step(Particle* swarm, SwarmParams* p, double dt, double diurnal_factor) {
+    double sqrt_dt = sqrt(dt);
     
-    for(int i=0; i<SWARM_SIZE; i++) {
-        Particle* p = &sw[i];
-        double vp = p->v + p->kappa*(p->theta - p->v)*dt; if(vp<1e-9)vp=1e-9;
-        double y = ret + 0.5*vp*dt;
-        double S = vp*dt + p->lambda_j*p->sigma_j*p->sigma_j*dt;
-        double ll = (1.0/sqrt(2*M_PI*S)) * exp(-0.5*y*y/S);
-        p->weight *= ll; sum_w += p->weight;
-        p->v = vp + p->sigma_v*sqrt(vp*dt)*norm_rand(); if(p->v<1e-9)p->v=1e-9;
+    for(int i=0; i<N_PARTICLES; i++) {
+        // 1. Evolve Variance (Heston with Diurnal Scaling)
+        // We revert to Theta * DiurnalFactor
+        double theta_t = p->theta * diurnal_factor;
+        double dw_v = get_random_normal();
+        
+        double v_prev = swarm[i].v;
+        double v_drift = p->kappa * (theta_t - v_prev) * dt;
+        double v_diff = p->sigma_v * sqrt(v_prev) * dw_v * sqrt_dt;
+        
+        swarm[i].v = v_prev + v_drift + v_diff;
+        if(swarm[i].v < 1e-6) swarm[i].v = 1e-6; // Floor
+        
+        // 2. Evolve Correlation (Jacobi Process - Mean Reverting Bounded)
+        // Allows system to adapt to "Correlation Breakdown"
+        double rho_drift = 2.0 * (p->rho_mean - swarm[i].rho) * dt;
+        double rho_diff = 0.2 * sqrt(1 - swarm[i].rho*swarm[i].rho) * get_random_normal() * sqrt_dt;
+        swarm[i].rho += rho_drift + rho_diff;
+        if(swarm[i].rho > 0.99) swarm[i].rho = 0.99;
+        if(swarm[i].rho < -0.99) swarm[i].rho = -0.99;
+        
+        // 3. Evolve Drift (Local Trend Hypothesis)
+        // Random walk for trend perception
+        swarm[i].mu += 0.5 * get_random_normal() * sqrt_dt; 
+        
+        // 4. Jump Switch (Poisson)
+        if (get_random_uniform() < p->lambda_j * dt) {
+            swarm[i].jump_state = 1;
+        } else {
+            swarm[i].jump_state = 0;
+        }
+    }
+}
+
+// --- Step 2: Update (Correction) ---
+// Solves "Aliasing" by using Range (High-Low) info
+void update_step(Particle* swarm, SwarmParams* p, double ret, double range_sq, double dt) {
+    double sum_weight = 0.0;
+    
+    for(int i=0; i<N_PARTICLES; i++) {
+        // Expected mean and variance for this particle
+        double mu_exp = swarm[i].mu * dt;
+        if (swarm[i].jump_state) mu_exp += p->mu_j;
+        
+        double var_exp = swarm[i].v * dt;
+        if (swarm[i].jump_state) var_exp += (p->mu_j*p->mu_j + p->sigma_j*p->sigma_j);
+        
+        // 1. Return Likelihood (Gaussian)
+        double resid = ret - mu_exp;
+        double pdf_ret = (1.0 / sqrt(2 * M_PI * var_exp)) * exp(-0.5 * resid*resid / var_exp);
+        
+        // 2. Range Likelihood (Parkinson / Aliasing Fix)
+        // E[Range^2] approx 4 * ln(2) * var
+        // This penalizes particles that predict Low Volatility when Range is high
+        double expected_range_sq = 4.0 * 0.693 * var_exp; 
+        // Chi-Square like penalty for range mismatch
+        double range_ratio = range_sq / (expected_range_sq + 1e-9);
+        double pdf_range = exp(-0.5 * (range_ratio + log(expected_range_sq))); 
+        
+        // Update Weight
+        // We combine both evidences.
+        swarm[i].weight *= (pdf_ret * pdf_range);
+        sum_weight += swarm[i].weight;
     }
     
-    if(sum_w < 1e-40) { 
-        for(int i=0; i<SWARM_SIZE; i++) sw[i].weight = 1.0/SWARM_SIZE; sum_w=1.0;
+    // Normalize
+    if (sum_weight < 1e-15) sum_weight = 1e-15;
+    for(int i=0; i<N_PARTICLES; i++) {
+        swarm[i].weight /= sum_weight;
+    }
+}
+
+// --- Step 3: Resample (Regularized) ---
+// Solves "Particle Degeneracy" by jittering clones
+void resample_regularized(Particle* swarm, SwarmParams* p) {
+    // Calculate Effective Sample Size (ESS)
+    double sum_sq_w = 0;
+    for(int i=0; i<N_PARTICLES; i++) sum_sq_w += swarm[i].weight * swarm[i].weight;
+    double ess = 1.0 / sum_sq_w;
+    
+    // Only resample if degeneracy is high
+    if (ess > N_PARTICLES * 0.5) return;
+    
+    Particle new_swarm[N_PARTICLES];
+    double cdf[N_PARTICLES];
+    cdf[0] = swarm[0].weight;
+    for(int i=1; i<N_PARTICLES; i++) cdf[i] = cdf[i-1] + swarm[i].weight;
+    
+    for(int i=0; i<N_PARTICLES; i++) {
+        double r = get_random_uniform();
+        int idx = 0;
+        // Binary search for speed
+        int lower = 0, upper = N_PARTICLES-1;
+        while(lower <= upper) {
+            int mid = lower + (upper-lower)/2;
+            if (cdf[mid] < r) lower = mid + 1;
+            else { idx = mid; upper = mid - 1; }
+        }
+        
+        new_swarm[i] = swarm[idx];
+        new_swarm[i].weight = 1.0 / N_PARTICLES;
+        
+        // JITTER (Regularization)
+        // Prevents collapse into a single point
+        new_swarm[i].v *= (1.0 + 0.05 * get_random_normal());
+        new_swarm[i].mu += 0.001 * get_random_normal();
     }
     
+    memcpy(swarm, new_swarm, N_PARTICLES * sizeof(Particle));
+}
+
+// --- Metrics Aggregator ---
+void calc_swarm_metrics(Particle* swarm, SwarmMetrics* out) {
+    double w_mu = 0;
+    double w_rho = 0;
+    double w_jump = 0;
     double entropy = 0;
-    for(int i=0; i<SWARM_SIZE; i++) {
-        sw[i].weight /= sum_w;
-        sum_sq += sw[i].weight*sw[i].weight;
-        m_v += sw[i].weight * sqrt(sw[i].v);
-        double tot = sw[i].v + sw[i].lambda_j*sw[i].sigma_j*sw[i].sigma_j;
-        m_z += sw[i].weight * (ret / sqrt(tot*dt));
-        if(sw[i].weight > 1e-12) entropy -= sw[i].weight*log(sw[i].weight);
-    }
-    out->spot_vol_mean = m_v;
-    out->innovation_z = m_z;
-    out->ess = 1.0/sum_sq;
-    out->entropy = entropy;
     
-    if(out->ess < SWARM_SIZE/4) {
-        Particle* nw = malloc(SWARM_SIZE*sizeof(Particle));
-        double c=0, u=((double)rand()/RAND_MAX)/SWARM_SIZE; int k=0;
-        for(int i=0; i<SWARM_SIZE; i++) {
-            double t = u + (double)i/SWARM_SIZE;
-            while(c<t) c+=sw[k++].weight;
-            nw[i]=sw[k-1]; nw[i].weight=1.0/SWARM_SIZE;
-        }
-        memcpy(sw, nw, SWARM_SIZE*sizeof(Particle)); free(nw);
-    }
-}
-
-// --- NEW: ASYMMETRIC SIMULATION ENGINE ---
-void run_asymmetric_simulation(Particle* swarm, double price, double z_score, double dt, MarketMicrostructure m, ContrastiveResult* out) {
-    Particle scenarios[SIM_SCENARIOS];
-    double u = ((double)rand()/RAND_MAX)/SIM_SCENARIOS; double c=0; int k=0;
-    for(int i=0; i<SIM_SCENARIOS; i++) {
-        double t = u + (double)i/SIM_SCENARIOS;
-        while(c<t && k<SWARM_SIZE) c+=swarm[k++].weight;
-        scenarios[i] = swarm[k-1];
+    // Sort for Percentile (Risk Vol) - Simplified linear scan for demo
+    // Ideally use quickselect for 95th percentile
+    // Here we use Weighted Mean + 2 StdDev approximation for speed
+    double mean_v = 0;
+    double var_v = 0;
+    
+    for(int i=0; i<N_PARTICLES; i++) {
+        double w = swarm[i].weight;
+        w_mu += w * swarm[i].mu;
+        w_rho += w * swarm[i].rho;
+        w_jump += w * swarm[i].jump_state;
+        mean_v += w * swarm[i].v;
+        
+        if (w > 0) entropy -= w * log(w);
     }
     
-    double s_l=0, s2_l=0, s_s=0, s2_s=0, s_h=0, s_fric=0;
-    int n_sims = SIM_SCENARIOS * PATHS_PER_SCENARIO;
-    
-    // --- PHYSICS POLARIZATION ---
-    // Bias physics based on Z-Score magnitude
-    // If Z > 0, Up Jumps are more likely.
-    double bias_up = (z_score > 0) ? (1.0 + 0.3*fabs(z_score)) : (1.0 / (1.0 + 0.3*fabs(z_score)));
-    double bias_down = 1.0 / bias_up;
-    
-    for(int s=0; s<SIM_SCENARIOS; s++) {
-        Particle p = scenarios[s];
-        double current_vol = sqrt(p.v);
-        
-        // Directional Friction: Cheaper to trade WITH momentum
-        // Z > 0 (Up) -> Long cost low, Short cost high
-        double cost_long = price * (m.spread_bps + m.impact_coef * current_vol * (z_score > 0 ? 0.7 : 1.3));
-        double cost_short = price * (m.spread_bps + m.impact_coef * current_vol * (z_score < 0 ? 0.7 : 1.3));
-        
-        // Track avg friction for reporting
-        s_fric += (cost_long + cost_short) / 2.0;
-        
-        double stop_dist = m.stop_sigma * current_vol * sqrt(dt) * price;
-        
-        for(int n=0; n<PATHS_PER_SCENARIO; n++) {
-            double p_curr = price;
-            double v_curr = p.v;
-            double pnl_l = 0, pnl_s = 0;
-            int closed_l = 0, closed_s = 0;
-            
-            for(int t=0; t<m.horizon; t++) {
-                // Conditional Volatility (Feedback Loop)
-                // If price moves WITH Z-Score, dampen Sigma (Trend Stability)
-                // If price moves AGAINST Z-Score, amplify Sigma (Turbulence)
-                double move_dir = (p_curr - price);
-                double regime_stab = (move_dir * z_score > 0) ? 0.5 : 1.5; 
-                
-                double dW = norm_rand();
-                v_curr += p.kappa*(p.theta - v_curr)*dt + (p.sigma_v * regime_stab)*sqrt(v_curr*dt)*norm_rand();
-                if(v_curr<1e-9) v_curr=1e-9;
-                
-                // Asymmetric Jumps
-                double jump = 0;
-                if (((double)rand()/RAND_MAX) < p.lambda_j * bias_up * dt) jump += (0.02 + 0.05*norm_rand());
-                if (((double)rand()/RAND_MAX) < p.lambda_j * bias_down * dt) jump -= (0.02 + 0.05*norm_rand());
-                
-                p_curr *= (1.0 + sqrt(v_curr*dt)*dW + jump);
-                
-                // Decay
-                double decay = exp(-m.decay_rate * t);
-                double target = m.target_sigma_init * decay * current_vol * sqrt(dt) * price;
-                
-                double diff = p_curr - price;
-                if(!closed_l) {
-                    if(diff < -stop_dist) { pnl_l = -stop_dist - cost_long; closed_l=1; }
-                    if(diff > target) { pnl_l = target - cost_long; closed_l=1; }
-                }
-                if(!closed_s) {
-                    if(diff > stop_dist) { pnl_s = -stop_dist - cost_short; closed_s=1; }
-                    if(diff < -target) { pnl_s = target - cost_short; closed_s=1; }
-                }
-                if(closed_l && closed_s) break;
-            }
-            
-            if(!closed_l) pnl_l = (p_curr - price) - cost_long;
-            if(!closed_s) pnl_s = (price - p_curr) - cost_short;
-            double pnl_h = (p_curr - price); 
-            
-            s_l += pnl_l; s2_l += pnl_l*pnl_l;
-            s_s += pnl_s; s2_s += pnl_s*pnl_s;
-            s_h += pnl_h; 
-        }
+    for(int i=0; i<N_PARTICLES; i++) {
+        var_v += swarm[i].weight * pow(swarm[i].v - mean_v, 2);
     }
     
-    double mu_l = s_l / n_sims;
-    double std_l = sqrt((s2_l/n_sims) - mu_l*mu_l);
+    out->expected_return = w_mu;
+    out->effective_rho = w_rho;
+    out->regime_prob = w_jump;
+    out->swarm_entropy = entropy;
     
-    double mu_s = s_s / n_sims;
-    double std_s = sqrt((s2_s/n_sims) - mu_s*mu_s);
-    
-    double mu_h = s_h / n_sims;
-    
-    out->friction_cost_avg = s_fric / SIM_SCENARIOS;
-    out->alpha_long = mu_l - mu_h; 
-    out->alpha_short = mu_s - (-mu_h); 
-    
-    out->t_stat_long = (std_l > 1e-9) ? (mu_l / (std_l/sqrt(n_sims))) : 0;
-    out->t_stat_short = (std_s > 1e-9) ? (mu_s / (std_s/sqrt(n_sims))) : 0;
-    
-    double pooled_std = sqrt((std_l*std_l + std_s*std_s)/2.0);
-    out->cohens_d = (pooled_std > 1e-9) ? fabs(mu_l - mu_s) / pooled_std : 0;
+    // Risk Volatility (Upper Bound of Swarm confidence)
+    out->risk_volatility = sqrt(mean_v + 2.0 * sqrt(var_v)); 
 }

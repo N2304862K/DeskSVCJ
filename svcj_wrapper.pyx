@@ -5,70 +5,78 @@ import numpy as np
 cimport numpy as np
 from libc.stdlib cimport malloc, free
 
-cdef extern from "svcj.h":
+cdef extern from "svcj_swarm.h":
+    # Structs must match C header exactly
     ctypedef struct Particle:
-        double kappa, theta, sigma_v, rho, lambda_j, v, weight
-    ctypedef struct FilterStats:
-        double spot_vol_mean, spot_vol_std, innovation_z, entropy, ess
-    ctypedef struct MarketMicrostructure:
-        double spread_bps, impact_coef, stop_sigma, target_sigma_init, decay_rate
-        int horizon
-    ctypedef struct ContrastiveResult:
-        double alpha_long, alpha_short, t_stat_long, t_stat_short
-        double cohens_d, friction_cost_avg
+        double v, mu, rho
+        int jump_state
+        double weight
         
-    void generate_prior_swarm(double* ohlcv, int n, double dt, Particle* out) nogil
-    void run_particle_filter_step(Particle* sw, double ret, double dt, FilterStats* out) nogil
-    void run_asymmetric_simulation(Particle* sw, double p, double z, double dt, MarketMicrostructure m, ContrastiveResult* r) nogil
-
-cdef np.ndarray[double, ndim=2, mode='c'] _sanitize(object d):
-    return np.ascontiguousarray(np.asarray(d, dtype=np.float64))
-
-cdef class ParticleEngine:
-    cdef Particle* swarm
-    cdef public double dt
-    cdef int swarm_size
+    ctypedef struct SwarmParams:
+        double kappa, theta, sigma_v, rho_mean, lambda_j, mu_j, sigma_j
+        
+    ctypedef struct SwarmMetrics:
+        double expected_return, risk_volatility, swarm_entropy, regime_prob, effective_rho
     
-    def __cinit__(self, object ohlcv, double dt):
-        cdef np.ndarray[double, ndim=2, mode='c'] data = _sanitize(ohlcv)
-        self.swarm_size = 5000
-        self.swarm = <Particle*> malloc(self.swarm_size * sizeof(Particle))
+    void init_swarm(Particle* swarm, SwarmParams* p) nogil
+    void predict_step(Particle* swarm, SwarmParams* p, double dt, double diurnal) nogil
+    void update_step(Particle* swarm, SwarmParams* p, double ret, double rng, double dt) nogil
+    void resample_regularized(Particle* swarm, SwarmParams* p) nogil
+    void calc_swarm_metrics(Particle* swarm, SwarmMetrics* out) nogil
+
+cdef class SwarmEngine:
+    cdef Particle* particles
+    cdef SwarmParams params
+    cdef double dt
+    cdef int n_particles
+    
+    def __init__(self, dict physics, double dt):
+        self.n_particles = 2000
+        self.particles = <Particle*> malloc(self.n_particles * sizeof(Particle))
         self.dt = dt
-        generate_prior_swarm(&data[0,0], data.shape[0], dt, self.swarm)
         
-    def __dealloc__(self):
-        if self.swarm is not NULL: free(self.swarm)
+        # Load Physics
+        self.params.kappa = physics['kappa']
+        self.params.theta = physics['theta']
+        self.params.sigma_v = physics['sigma_v']
+        self.params.rho_mean = physics['rho']
+        self.params.lambda_j = physics['lambda_j']
+        self.params.mu_j = -0.05 # Default downside skew for jumps
+        self.params.sigma_j = 0.05
+        
+        # Init
+        with nogil:
+            init_swarm(self.particles, &self.params)
             
-    def update(self, double p_now, double p_prev):
-        cdef double ret = np.log(p_now / p_prev)
-        cdef FilterStats s
-        run_particle_filter_step(self.swarm, ret, self.dt, &s)
-        return {
-            "spot_vol": s.spot_vol_mean,
-            "z": s.innovation_z,
-            "ess": s.ess,
-            "entropy": s.entropy
-        }
-    
-    def evaluate_asymmetric(self, double price, double z_score, dict config):
-        cdef MarketMicrostructure m
-        m.spread_bps = config.get('spread_bps', 0.0002)
-        m.impact_coef = config.get('impact', 0.1)
-        m.stop_sigma = config.get('stop', 2.0)
-        m.target_sigma_init = config.get('target', 4.0)
-        m.decay_rate = config.get('decay', 0.05)
-        m.horizon = config.get('horizon', 12)
+    def __dealloc__(self):
+        free(self.particles)
         
-        cdef ContrastiveResult r
+    def update(self, double ret, double range_sq, double diurnal_factor):
+        """
+        Steps the Swarm forward 1 tick.
+        ret: Log Return (Close-to-Close)
+        range_sq: (High-Low)^2 / Close^2 (Parkinson Vol Proxy)
+        diurnal_factor: 1.0 = Average, 2.0 = Open/Close, 0.5 = Lunch
+        """
+        cdef SwarmMetrics m
         
         with nogil:
-            run_asymmetric_simulation(self.swarm, price, z_score, self.dt, m, &r)
+            # 1. Predict (Drift & Diffuse)
+            predict_step(self.particles, &self.params, self.dt, diurnal_factor)
+            
+            # 2. Update (Weight by Evidence)
+            update_step(self.particles, &self.params, ret, range_sq, self.dt)
+            
+            # 3. Resample (Survival of fittest)
+            resample_regularized(self.particles, &self.params)
+            
+            # 4. Measure
+            calc_swarm_metrics(self.particles, &m)
             
         return {
-            "alpha_long": r.alpha_long,
-            "alpha_short": r.alpha_short,
-            "t_long": r.t_stat_long,
-            "t_short": r.t_stat_short,
-            "separation": r.cohens_d,
-            "friction": r.friction_cost_avg
+            "ev_drift": m.expected_return,
+            "risk_vol": m.risk_volatility,
+            "entropy": m.swarm_entropy,
+            "jump_prob": m.regime_prob,
+            "rho": m.effective_rho
         }
