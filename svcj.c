@@ -1,7 +1,7 @@
 #include "svcj.h"
 #include <float.h>
 
-// --- Helper Functions ---
+// --- Utils ---
 void compute_log_returns(double* ohlcv, int n_rows, double* out_returns) {
     for(int i=1; i<n_rows; i++) {
         double prev = ohlcv[(i-1)*N_COLS + 3];
@@ -11,174 +11,159 @@ void compute_log_returns(double* ohlcv, int n_rows, double* out_returns) {
     }
 }
 
-double gaussian_pdf(double x, double mean, double var) {
-    if (var < 1e-12) var = 1e-12;
-    double coeff = 1.0 / sqrt(2.0 * M_PI * var);
-    double exponent = -0.5 * (x - mean) * (x - mean) / var;
-    return coeff * exp(exponent);
+// Gaussian PDF
+double gaussian_prob(double x, double mu, double sigma) {
+    if (sigma < 1e-9) sigma = 1e-9;
+    double exponent = -0.5 * pow((x - mu) / sigma, 2);
+    return (1.0 / (SQRT_2PI * sigma)) * exp(exponent);
 }
 
-// --- HMM Core Algorithms ---
-void train_hmm(double* ohlcv, int n_obs, int n_states, double dt, HMMResult* result) {
-    int n_ret = n_obs - 1;
-    double* returns = malloc(n_ret * sizeof(double));
-    compute_log_returns(ohlcv, n_obs, returns);
+// --- Baum-Welch (The Solver) ---
+void run_baum_welch(double* returns, int n, HMMModel* model) {
+    // 1. Initialization (Reasonable Guesses)
+    // State 0: Bull, State 1: Bear, State 2: Neutral
+    model->states[0].mu = 0.0005; model->states[0].sigma = 0.005;
+    model->states[1].mu = -0.0005; model->states[1].sigma = 0.01;
+    model->states[2].mu = 0.0; model->states[2].sigma = 0.002;
     
-    // 1. Initialization
-    HMMModel model;
-    model.n_states = n_states;
-    
-    for(int i=0; i<n_states; i++) {
-        model.initial_probs[i] = 1.0 / n_states;
-        for(int j=0; j<n_states; j++) {
-            model.transitions[i][j] = 1.0 / n_states;
+    // Transition Matrix: High prob of staying in same state
+    for(int i=0; i<N_STATES; i++) {
+        for(int j=0; j<N_STATES; j++) {
+            model->transitions[i][j] = (i==j) ? 0.98 : 0.01;
         }
     }
     
-    int chunk_size = n_ret / n_states;
-    for(int i=0; i<n_states; i++) {
-        double sum = 0, sum_sq = 0;
-        int start = i * chunk_size;
-        int end = (i + 1) * chunk_size;
-        for(int t=start; t<end; t++) {
-            sum += returns[t];
-            sum_sq += returns[t] * returns[t];
-        }
-        model.means[i] = sum / chunk_size;
-        model.variances[i] = (sum_sq / chunk_size) - (model.means[i] * model.means[i]);
-    }
-    
-    double* alpha = malloc(n_ret * n_states * sizeof(double));
-    double* beta = malloc(n_ret * n_states * sizeof(double));
-    double* gamma = malloc(n_ret * n_states * sizeof(double));
-    double* xi = malloc(n_ret * n_states * n_states * sizeof(double));
-    double* scale = malloc(n_ret * sizeof(double));
-    
-    double old_log_lik = -DBL_MAX;
-    
-    for(int iter=0; iter<MAX_ITER; iter++) {
-        // --- E-Step ---
-        // Forward
-        scale[0] = 0.0;
-        for(int i=0; i<n_states; i++) {
-            alpha[i] = model.initial_probs[i] * gaussian_pdf(returns[0], model.means[i], model.variances[i]);
-            scale[0] += alpha[i];
-        }
-        for(int i=0; i<n_states; i++) alpha[i] /= scale[0];
+    model->initial_probs[0] = 0.33; model->initial_probs[1] = 0.33; model->initial_probs[2] = 0.34;
+
+    // Allocate Memory for Forward/Backward Pass
+    double* alpha = malloc(n * N_STATES * sizeof(double));
+    double* beta = malloc(n * N_STATES * sizeof(double));
+    double* c = malloc(n * sizeof(double)); // Scaling factor
+
+    // EM Loop
+    for (int iter = 0; iter < MAX_ITER; ++iter) {
+        // --- E-Step: Forward-Backward Pass ---
         
-        for(int t=1; t<n_ret; t++) {
-            scale[t] = 0.0;
-            for(int i=0; i<n_states; i++) {
-                double sum = 0.0;
-                for(int j=0; j<n_states; j++) {
-                    sum += alpha[(t-1)*n_states + j] * model.transitions[j][i];
+        // Forward (alpha)
+        c[0] = 0;
+        for(int i=0; i<N_STATES; i++) {
+            alpha[i] = model->initial_probs[i] * gaussian_prob(returns[0], model->states[i].mu, model->states[i].sigma);
+            c[0] += alpha[i];
+        }
+        if(c[0] > 1e-9) for(int i=0; i<N_STATES; i++) alpha[i] /= c[0]; // Scale
+        
+        for(int t=1; t<n; t++) {
+            c[t] = 0;
+            for(int i=0; i<N_STATES; i++) {
+                double alpha_sum = 0;
+                for(int j=0; j<N_STATES; j++) {
+                    alpha_sum += alpha[(t-1)*N_STATES + j] * model->transitions[j][i];
                 }
-                alpha[t*n_states + i] = sum * gaussian_pdf(returns[t], model.means[i], model.variances[i]);
-                scale[t] += alpha[t*n_states + i];
+                alpha[t*N_STATES + i] = alpha_sum * gaussian_prob(returns[t], model->states[i].mu, model->states[i].sigma);
+                c[t] += alpha[t*N_STATES + i];
             }
-            if (scale[t] > 0) {
-                for(int i=0; i<n_states; i++) alpha[t*n_states + i] /= scale[t];
-            }
+            if(c[t] > 1e-9) for(int i=0; i<N_STATES; i++) alpha[t*N_STATES + i] /= c[t]; // Scale
         }
         
-        // Backward
-        for(int i=0; i<n_states; i++) beta[(n_ret-1)*n_states + i] = 1.0;
+        // Backward (beta)
+        for(int i=0; i<N_STATES; i++) beta[(n-1)*N_STATES + i] = 1.0;
         
-        for(int t=n_ret-2; t>=0; t--) {
-            for(int i=0; i<n_states; i++) {
-                double sum = 0.0;
-                for(int j=0; j<n_states; j++) {
-                    sum += model.transitions[i][j] * gaussian_pdf(returns[t+1], model.means[j], model.variances[j]) * beta[(t+1)*n_states + j];
+        for(int t=n-2; t>=0; t--) {
+            for(int i=0; i<N_STATES; i++) {
+                beta[t*N_STATES + i] = 0;
+                for(int j=0; j<N_STATES; j++) {
+                    beta[t*N_STATES + i] += model->transitions[i][j] * gaussian_prob(returns[t+1], model->states[j].mu, model->states[j].sigma) * beta[(t+1)*N_STATES + j];
                 }
-                beta[t*n_states + i] = sum / scale[t+1];
+                beta[t*N_STATES + i] /= c[t+1]; // Scale
             }
         }
         
-        // Gamma and Xi
-        for(int t=0; t<n_ret-1; t++) {
-            double den = 0.0;
-            for(int i=0; i<n_states; i++) den += alpha[t*n_states+i]*beta[t*n_states+i];
+        // --- M-Step: Re-estimate Parameters ---
+        double gamma[N_STATES], xi[N_STATES][N_STATES];
+        
+        // Transitions
+        for(int i=0; i<N_STATES; i++) {
+            double den = 0;
+            for(int t=0; t<n-1; t++) {
+                den += alpha[t*N_STATES + i] * beta[t*N_STATES + i];
+            }
+            if(den < 1e-9) den = 1e-9;
             
-            for(int i=0; i<n_states; i++) {
-                gamma[t*n_states+i] = (alpha[t*n_states+i]*beta[t*n_states+i]) / den;
-                for(int j=0; j<n_states; j++) {
-                    double num = alpha[t*n_states+i] * model.transitions[i][j] * gaussian_pdf(returns[t+1], model.means[j], model.variances[j]) * beta[(t+1)*n_states+j];
-                    xi[t*n_states*n_states + i*n_states + j] = num / den / scale[t+1];
+            for(int j=0; j<N_STATES; j++) {
+                double num = 0;
+                for(int t=0; t<n-1; t++) {
+                    num += alpha[t*N_STATES + i] * model->transitions[i][j] * gaussian_prob(returns[t+1], model->states[j].mu, model->states[j].sigma) * beta[(t+1)*N_STATES + j];
                 }
+                model->transitions[i][j] = num / den;
             }
         }
         
-        // --- M-Step ---
-        for(int i=0; i<n_states; i++) model.initial_probs[i] = gamma[i];
-        
-        for(int i=0; i<n_states; i++) {
-            double den = 0.0;
-            for(int t=0; t<n_ret-1; t++) den += gamma[t*n_states+i];
+        // Emissions (Mu, Sigma)
+        for(int i=0; i<N_STATES; i++) {
+            double gamma_sum = 0;
+            double mu_num = 0, sigma_num = 0;
             
-            for(int j=0; j<n_states; j++) {
-                double num = 0.0;
-                for(int t=0; t<n_ret-1; t++) num += xi[t*n_states*n_states + i*n_states+j];
-                model.transitions[i][j] = num / den;
+            for(int t=0; t<n; t++) {
+                double g = alpha[t*N_STATES + i] * beta[t*N_STATES + i];
+                gamma_sum += g;
+                mu_num += g * returns[t];
             }
-        }
-        
-        for(int i=0; i<n_states; i++) {
-            double gamma_sum=0, mean_num=0, var_num=0;
-            for(int t=0; t<n_ret; t++) {
-                gamma_sum += gamma[t*n_states+i];
-                mean_num += gamma[t*n_states+i] * returns[t];
-            }
-            model.means[i] = mean_num / gamma_sum;
+            if(gamma_sum < 1e-9) gamma_sum = 1e-9;
+            double new_mu = mu_num / gamma_sum;
+            model->states[i].mu = new_mu;
             
-            for(int t=0; t<n_ret; t++) {
-                double diff = returns[t] - model.means[i];
-                var_num += gamma[t*n_states+i] * diff * diff;
+            for(int t=0; t<n; t++) {
+                double g = alpha[t*N_STATES + i] * beta[t*N_STATES + i];
+                sigma_num += g * pow(returns[t] - new_mu, 2);
             }
-            model.variances[i] = var_num / gamma_sum;
+            model->states[i].sigma = sqrt(sigma_num / gamma_sum);
         }
-        
-        double log_lik = 0;
-        for(int t=0; t<n_ret; t++) log_lik += log(scale[t]);
-        
-        if (fabs(log_lik - old_log_lik) < 0.001) break;
-        old_log_lik = log_lik;
+    }
+    free(alpha); free(beta); free(c);
+}
+
+// --- Viterbi (The Decoder) ---
+void decode_states_viterbi(double* returns, int n, HMMModel* model, int* out_path) {
+    double* T1 = malloc(n * N_STATES * sizeof(double));
+    int* T2 = malloc(n * N_STATES * sizeof(int));
+    
+    // Init
+    for(int i=0; i<N_STATES; i++) {
+        T1[i] = log(model->initial_probs[i] + 1e-30) + log(gaussian_prob(returns[0], model->states[i].mu, model->states[i].sigma) + 1e-30);
     }
     
-    // Viterbi
-    int* viterbi_path = malloc(n_ret * sizeof(int));
-    double* T1 = malloc(n_ret * n_states * sizeof(double));
-    int* T2 = malloc(n_ret * n_states * sizeof(int));
-    
-    for(int i=0; i<n_states; i++) {
-        T1[i] = log(model.initial_probs[i]) + log(gaussian_pdf(returns[0], model.means[i], model.variances[i]));
-    }
-    
-    for(int t=1; t<n_ret; t++) {
-        for(int j=0; j<n_states; j++) {
-            double max_val = -DBL_MAX;
+    // Forward
+    for(int t=1; t<n; t++) {
+        for(int i=0; i<N_STATES; i++) {
+            double max_prob = -1e30;
             int max_idx = 0;
-            for(int i=0; i<n_states; i++) {
-                double val = T1[(t-1)*n_states+i] + log(model.transitions[i][j]);
-                if (val > max_val) { max_val = val; max_idx = i; }
+            for(int j=0; j<N_STATES; j++) {
+                double prob = T1[(t-1)*N_STATES + j] + log(model->transitions[j][i] + 1e-30);
+                if (prob > max_prob) {
+                    max_prob = prob;
+                    max_idx = j;
+                }
             }
-            T1[t*n_states+j] = max_val + log(gaussian_pdf(returns[t], model.means[j], model.variances[j]));
-            T2[t*n_states+j] = max_idx;
+            T1[t*N_STATES + i] = max_prob + log(gaussian_prob(returns[t], model->states[i].mu, model->states[i].sigma) + 1e-30);
+            T2[t*N_STATES + i] = max_idx;
         }
     }
+    
+    // Find last state
+    double max_final = -1e30;
+    int last_state = 0;
+    for(int i=0; i<N_STATES; i++) {
+        if(T1[(n-1)*N_STATES + i] > max_final) {
+            max_final = T1[(n-1)*N_COLS + i];
+            last_state = i;
+        }
+    }
+    out_path[n-1] = last_state;
     
     // Backtrack
-    double max_prob = -DBL_MAX;
-    for(int i=0; i<n_states; i++) {
-        if(T1[(n_ret-1)*n_states+i] > max_prob) { max_prob = T1[(n_ret-1)*n_states+i]; viterbi_path[n_ret-1] = i; }
-    }
-    for(int t=n_ret-2; t>=0; t--) {
-        viterbi_path[t] = T2[(t+1)*n_states + viterbi_path[t+1]];
+    for(int t=n-2; t>=0; t--) {
+        out_path[t] = T2[(t+1)*N_STATES + out_path[t+1]];
     }
     
-    result->model = model;
-    result->viterbi_path = viterbi_path;
-    
-    free(alpha); free(beta); free(gamma); free(xi); free(scale);
     free(T1); free(T2);
-    free(returns);
 }

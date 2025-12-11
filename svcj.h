@@ -6,26 +6,31 @@
 #include <stdio.h>
 #include <string.h>
 
-#define MAX_STATES 5
-#define MAX_ITER 100
+#define N_STATES 3 // Bull, Bear, Neutral
+#define MAX_ITER 50 // Baum-Welch Iterations
+#define SQRT_2PI 2.50662827463
 #define N_COLS 5
 
-// --- Structures ---
+// The Physics of a SINGLE Regime (State)
 typedef struct {
-    int n_states;
-    double initial_probs[MAX_STATES];
-    double transitions[MAX_STATES][MAX_STATES];
-    double means[MAX_STATES];
-    double variances[MAX_STATES];
+    double mu;           // Drift
+    double sigma;        // Volatility
+} HMMStateParams;
+
+// The Full HMM Model
+typedef struct {
+    HMMStateParams states[N_STATES];
+    double transitions[N_STATES][N_STATES]; // A[i][j] = Prob(State i -> State j)
+    double initial_probs[N_STATES];
 } HMMModel;
 
-typedef struct {
-    HMMModel model;
-    double log_likelihood;
-    int* viterbi_path;
-} HMMResult;
+// Core Utils
+void compute_log_returns(double* ohlcv, int n, double* out_returns);
 
-// --- Function Prototypes ---
-void train_hmm(double* ohlcv, int n_obs, int n_states, double dt, HMMResult* result);
+// Baum-Welch Algorithm (The "Solver")
+void run_baum_welch(double* returns, int n, HMMModel* model);
+
+// Viterbi Algorithm (The "Decoder")
+void decode_states_viterbi(double* returns, int n, HMMModel* model, int* out_path);
 
 #endif
