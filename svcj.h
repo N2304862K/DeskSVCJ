@@ -6,35 +6,30 @@
 #include <stdio.h>
 #include <string.h>
 
-#define N_PARTICLES 3000
-#define N_COLS 5 // OHLCV
+#define N_STATES 3 // 0=Bull, 1=Bear, 2=Neutral
+#define N_COLS 5
 #define SQRT_2PI 2.50662827463
 
-// The State of a Single Particle
+// The Physics of a SINGLE Regime
 typedef struct {
-    double v;            // Current Variance
-    double mu;           // Current Drift (Mean-Reverting)
-    double weight;       // The Likelihood
-    int regime;          // 0=Bull, 1=Bear, 2=Neutral
-} Particle;
+    double mu;     // Drift
+    double sigma;  // Volatility (Simplified from full SVCJ for HMM state)
+} RegimeParams;
 
-// The Host Filter State
+// The Complete HMM Model
 typedef struct {
-    // Aggregates
-    double p_bull;
-    double p_bear;
-    double p_neutral;
-    double entropy;
-    
-    // Core SVCJ Physics (Fixed per filter instance)
-    double kappa;
-    double theta;
-    double sigma_v;
-    double dt;
-} IMMState;
+    RegimeParams states[N_STATES];
+    double transitions[N_STATES][N_STATES]; // A[i][j] = Prob of going from State i to j
+    double initial_probs[N_STATES];       // Pi
+} HMM;
 
-// Core functions exposed to Cython
-void init_particle_set(Particle* particles, double theta, double start_price);
-void update_particles(Particle* particles, IMMState* state, double o, double h, double l, double c, double vol_factor, double range_factor);
+// Core Utils
+void compute_log_returns(double* ohlcv, int n_rows, double* out_returns);
+
+// Main HMM Engine
+void train_svcj_hmm(double* returns, int n, double dt, int max_iter, HMM* out_model);
+
+// Viterbi Algorithm (Finds the most likely path of hidden states)
+void decode_regime_path(double* returns, int n, double dt, HMM* model, int* out_path);
 
 #endif
