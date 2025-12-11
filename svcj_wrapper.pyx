@@ -3,78 +3,56 @@
 
 import numpy as np
 cimport numpy as np
+from libc.stdlib cimport malloc, free
 
 cdef extern from "svcj.h":
-    int N_STATES
+    int MAX_STATES
+    ctypedef struct HMMModel:
+        int n_states
+        double initial_probs[MAX_STATES]
+        double transitions[MAX_STATES][MAX_STATES]
+        double means[MAX_STATES]
+        double variances[MAX_STATES]
+    ctypedef struct HMMResult:
+        HMMModel model
+        int* viterbi_path
     
-    ctypedef struct RegimeParams:
-        double mu, sigma
-    ctypedef struct HMM:
-        RegimeParams states[N_STATES]
-        double transitions[N_STATES][N_STATES]
-        double initial_probs[N_STATES]
-    
-    void compute_log_returns(double* ohlcv, int n, double* out) nogil
-    void train_svcj_hmm(double* returns, int n, double dt, int max_iter, HMM* out) nogil
-    void decode_regime_path(double* returns, int n, double dt, HMM* model, int* out) nogil
+    void train_hmm(double* ohlcv, int n_obs, int n_states, double dt, HMMResult* result) nogil
 
 cdef np.ndarray[double, ndim=2, mode='c'] _sanitize(object d):
     return np.ascontiguousarray(np.asarray(d, dtype=np.float64))
 
-def train(object ohlcv, double dt, int max_iter=100):
+def discover_regimes(object ohlcv, double dt, int n_states=3):
     """
-    Fits the Hidden Markov Model to the data.
-    Returns: The discovered Physics (Params, Transitions).
+    Runs the Baum-Welch algorithm to discover hidden market regimes.
     """
     cdef np.ndarray[double, ndim=2, mode='c'] data = _sanitize(ohlcv)
-    cdef int n = data.shape[0]
-    cdef int n_ret = n - 1
+    cdef int n_obs = data.shape[0]
     
-    cdef np.ndarray[double, ndim=1, mode='c'] ret = np.zeros(n_ret, dtype=np.float64)
-    compute_log_returns(&data[0,0], n, &ret[0])
+    # HMM Result container
+    cdef HMMResult res
     
-    cdef HMM model
-    train_svcj_hmm(&ret[0], n_ret, dt, max_iter, &model)
-    
-    # Unpack to Python dict
-    states = []
-    for i in range(N_STATES):
-        states.append({"mu": model.states[i].mu, "sigma": model.states[i].sigma})
+    # Run C-Core (This can take a few seconds)
+    with nogil:
+        train_hmm(&data[0,0], n_obs, n_states, dt, &res)
         
-    transitions = np.zeros((N_STATES, N_STATES))
-    for i in range(N_STATES):
-        for j in range(N_STATES):
-            transitions[i, j] = model.transitions[i][j]
-            
+    # Unpack results into Python objects
+    model = res.model
+    
+    init = np.array(model.initial_probs[:n_states])
+    trans = np.array(model.transitions)[:n_states, :n_states]
+    means = np.array(model.means[:n_states])
+    variances = np.array(model.variances[:n_states])
+    
+    path = np.array([res.viterbi_path[i] for i in range(n_obs - 1)])
+    
+    # IMPORTANT: Free the memory allocated by C for the path
+    free(res.viterbi_path)
+    
     return {
-        "states": states,
-        "transitions": transitions,
-        "initial_probs": np.array(model.initial_probs)
+        "initial_probs": init,
+        "transitions": trans,
+        "means": means,
+        "variances": variances,
+        "path": path
     }
-
-def decode(object ohlcv, double dt, dict hmm_model):
-    """
-    Uses a trained HMM to find the most likely regime path.
-    """
-    cdef np.ndarray[double, ndim=2, mode='c'] data = _sanitize(ohlcv)
-    cdef int n = data.shape[0]
-    cdef int n_ret = n - 1
-    
-    cdef np.ndarray[double, ndim=1, mode='c'] ret = np.zeros(n_ret, dtype=np.float64)
-    compute_log_returns(&data[0,0], n, &ret[0])
-    
-    # Pack model from Python dict to C struct
-    cdef HMM model
-    for i in range(N_STATES):
-        s = hmm_model['states'][i]
-        model.states[i].mu = s['mu']
-        model.states[i].sigma = s['sigma']
-        
-        model.initial_probs[i] = hmm_model['initial_probs'][i]
-        for j in range(N_STATES):
-            model.transitions[i][j] = hmm_model['transitions'][i,j]
-            
-    cdef np.ndarray[int, ndim=1, mode='c'] path = np.zeros(n_ret, dtype=np.int32)
-    decode_regime_path(&ret[0], n_ret, dt, &model, &path[0])
-    
-    return path

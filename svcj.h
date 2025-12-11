@@ -6,30 +6,33 @@
 #include <stdio.h>
 #include <string.h>
 
-#define N_STATES 3 // 0=Bull, 1=Bear, 2=Neutral
+#define MAX_STATES 5
+#define MAX_ITER 100
 #define N_COLS 5
-#define SQRT_2PI 2.50662827463
 
-// The Physics of a SINGLE Regime
+// --- Structures ---
+
+// Holds the parameters of a trained HMM
 typedef struct {
-    double mu;     // Drift
-    double sigma;  // Volatility (Simplified from full SVCJ for HMM state)
-} RegimeParams;
+    int n_states;
+    double initial_probs[MAX_STATES];
+    double transitions[MAX_STATES][MAX_STATES];
+    // Emission parameters (Gaussian: mean, variance)
+    double means[MAX_STATES];
+    double variances[MAX_STATES];
+} HMMModel;
 
-// The Complete HMM Model
+// The final output of the training process
 typedef struct {
-    RegimeParams states[N_STATES];
-    double transitions[N_STATES][N_STATES]; // A[i][j] = Prob of going from State i to j
-    double initial_probs[N_STATES];       // Pi
-} HMM;
+    HMMModel model;
+    double log_likelihood;
+    // The Viterbi Path (most likely sequence of states)
+    int* viterbi_path;
+} HMMResult;
 
-// Core Utils
-void compute_log_returns(double* ohlcv, int n_rows, double* out_returns);
+// --- Function Prototypes ---
 
-// Main HMM Engine
-void train_svcj_hmm(double* returns, int n, double dt, int max_iter, HMM* out_model);
-
-// Viterbi Algorithm (Finds the most likely path of hidden states)
-void decode_regime_path(double* returns, int n, double dt, HMM* model, int* out_path);
+// Main entry point for training
+void train_hmm(double* ohlcv, int n_obs, int n_states, double dt, HMMResult* result);
 
 #endif
