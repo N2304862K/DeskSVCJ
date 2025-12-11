@@ -12,11 +12,11 @@
 #define CHI_SQ_CUTOFF 9.0
 
 typedef struct {
-    double v;           
-    double mu;          
-    double rho;         
-    double weight;      
-    double last_log_p;  
+    double v;           // Variance
+    double mu;          // Drift
+    double rho;         // Correlation
+    double weight;      // Probability
+    double last_log_p;  // Memory
 } Particle;
 
 typedef struct {
@@ -25,6 +25,7 @@ typedef struct {
     double ev_drift;
     double entropy;
     int collapsed;
+    double final_temperature; // Diagnostic: How hard did we have to crush it?
 } SwarmState;
 
 typedef struct {
@@ -37,7 +38,6 @@ typedef struct {
 } PhysicsParams;
 
 void init_swarm(PhysicsParams* phys, Particle* swarm, double start_price);
-// Updated Prototype
 void update_swarm(Particle* swarm, PhysicsParams* phys, 
                   double o, double h, double l, double c, 
                   double vol_ratio, double diurnal_factor, double macro_momentum, double dt, 

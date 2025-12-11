@@ -42,45 +42,57 @@ double calc_range_likelihood(double h, double l, double v, double dt) {
     return exp(-1.0 * m_dist);
 }
 
+// Sigmoid Contrast Function
+// Pushes weights < mean to 0, weights > mean to 1
+double sigmoid_weight(double w, double threshold, double sharp) {
+    return 1.0 / (1.0 + exp(-sharp * (w - threshold)));
+}
+
 void update_swarm(Particle* swarm, PhysicsParams* phys, 
                   double o, double h, double l, double c, 
                   double vol_ratio, double diurnal_factor, double macro_momentum, double dt, 
                   SwarmState* out) 
 {
     double log_c = log(c);
+    
+    // Limits
     if (vol_ratio < 0.1) vol_ratio = 0.1;
     if (vol_ratio > 10.0) vol_ratio = 10.0;
     
     double dt_eff = dt * vol_ratio;
     double theta_eff = phys->theta * diurnal_factor;
 
-    // 1. PROPAGATE & RAW WEIGHT
+    // --- A. PROPAGATE ---
     for(int i=0; i<N_PARTICLES; i++) {
         Particle* p = &swarm[i];
         
         double dw_v = rand_normal();
         double dw_drift = rand_normal();
         
-        // Variance
+        // Variance (Heston)
         p->v += phys->kappa * (theta_eff - p->v) * dt_eff + phys->sigma_v * sqrt(p->v) * dw_v * sqrt(dt_eff);
         if(p->v < 1e-6) p->v = 1e-6;
         if(p->v > 20.0) p->v = 20.0;
         
         // Drift (Momentum Injection)
-        double drift_pull = 5.0 * (macro_momentum - p->mu) * dt_eff;
-        double drift_noise = 0.5 * sqrt(p->v) * dw_drift * sqrt(dt_eff);
-        p->mu += drift_pull + drift_noise;
+        // Stronger pull to macro trend to reduce drift variance
+        double pull = 8.0 * (macro_momentum - p->mu) * dt_eff;
+        double noise = 0.5 * sqrt(p->v) * dw_drift * sqrt(dt_eff);
+        p->mu += pull + noise;
+        
+        if(p->mu > 10.0) p->mu = 10.0; if(p->mu < -10.0) p->mu = -10.0;
         
         int is_jump = 0;
         if ((next_rand()%10000)/10000.0 < (phys->lambda_j * dt_eff)) is_jump = 1;
         
-        // Likelihood
+        // --- B. RAW LIKELIHOOD ---
         double pred = p->last_log_p + (p->mu - 0.5*p->v)*dt_eff + (is_jump ? phys->mu_j : 0);
         double innov = log_c - pred;
         double var_tot = p->v*dt_eff + (is_jump ? (phys->mu_j*phys->mu_j + phys->sigma_j*phys->sigma_j) : 0);
         if(var_tot < 1e-9) var_tot = 1e-9;
         
         double m_dist = (innov * innov) / var_tot;
+        
         double like_ret = (m_dist > 12.0) ? 1e-25 : (1.0/sqrt(2*M_PI*var_tot)) * exp(-0.5 * m_dist);
         double like_rng = calc_range_likelihood(h, l, p->v, dt_eff);
         
@@ -89,95 +101,103 @@ void update_swarm(Particle* swarm, PhysicsParams* phys,
         if(p->weight < 1e-150) p->weight = 1e-150;
     }
     
-    // 2. ADAPTIVE ANNEALING (The Fix)
-    // We loop to crush entropy down to target 0.5
-    double target_entropy = 0.5;
-    double temperature = 1.0;
+    // --- C. ADAPTIVE ENTROPY CRUSHING (Annealing Loop) ---
+    // Goal: Force Entropy < 0.60
+    
+    double temp = 1.0;
     double entropy = 1.0;
     double sum_weight = 0;
     
-    // Max 3 annealing steps to save CPU
-    for(int step=0; step<3; step++) {
+    // Max 10 iterations to prevent hang
+    for(int k=0; k<10; k++) {
         sum_weight = 0.0;
         
-        // First pass: Calc Sum
+        // Calculate Sum for Norm
         for(int i=0; i<N_PARTICLES; i++) {
-            if(temperature < 1.0) swarm[i].weight = pow(swarm[i].weight, 1.0/temperature); // Sharpen
+            // Apply temperature: W' = W^(1/T)
+            // As T -> 0, this acts like ArgMax
+            if(k > 0) swarm[i].weight = pow(swarm[i].weight, 1.2); // Progressive sharpening
             sum_weight += swarm[i].weight;
         }
         
-        // Safety: Collapse check
+        // Safety Check
         if(sum_weight < 1e-100 || isnan(sum_weight)) {
+            // Collapse detected - Stop
             out->collapsed = 1;
-            // Lazarus Reset
-            for(int i=0; i<N_PARTICLES; i++) {
-                swarm[i].weight = 1.0/N_PARTICLES;
-                swarm[i].v = theta_eff;
-                swarm[i].mu = macro_momentum;
-            }
+            // Reset
+            sum_weight = 1.0;
+            for(int i=0; i<N_PARTICLES; i++) swarm[i].weight = 1.0/N_PARTICLES;
             entropy = 1.0;
-            break; // Stop annealing
+            break;
         } else {
             out->collapsed = 0;
         }
-
+        
         // Calc Entropy
         entropy = 0.0;
         for(int i=0; i<N_PARTICLES; i++) {
-            double norm_w = swarm[i].weight / sum_weight;
-            if(norm_w > 1e-12) entropy -= norm_w * log(norm_w);
+            double p_norm = swarm[i].weight / sum_weight;
+            if(p_norm > 1e-12) entropy -= p_norm * log(p_norm);
         }
         entropy /= log(N_PARTICLES);
         
-        // Check
-        if(entropy < target_entropy) break; // Good enough
-        
-        // Cool down (Increase contrast)
-        temperature *= 0.5; 
+        // Exit Condition: Confident enough
+        if(entropy < 0.60) {
+            temp = 1.0 / pow(1.2, k); // Track how much we squeezed
+            break; 
+        }
     }
     
     out->entropy = entropy;
+    out->final_temperature = temp;
 
-    // 3. AGGREGATE
-    out->ev_vol = 0; out->ev_drift = 0;
+    // --- D. AGGREGATE ---
+    out->ev_vol = 0;
+    out->ev_drift = 0;
     double sum_sq_weight = 0;
     
-    // Normalize final weights
-    for(int i=0; i<N_PARTICLES; i++) {
-        swarm[i].weight /= sum_weight;
-        sum_sq_weight += swarm[i].weight * swarm[i].weight;
-        
-        out->ev_vol += swarm[i].weight * sqrt(swarm[i].v);
-        out->ev_drift += swarm[i].weight * swarm[i].mu;
-    }
-    
-    // Mode
     #define BINS 50
     double bins[BINS] = {0};
-    double max_v = theta_eff * 6.0;
+    double max_v = theta_eff * 5.0;
+    
     for(int i=0; i<N_PARTICLES; i++) {
+        swarm[i].weight /= sum_weight;
+        double w = swarm[i].weight;
+        sum_sq_weight += w*w;
+        
+        out->ev_vol += w * sqrt(swarm[i].v);
+        out->ev_drift += w * swarm[i].mu;
+        
         int b = (int)((swarm[i].v / max_v) * BINS);
         if(b >= BINS) b = BINS-1;
-        bins[b] += swarm[i].weight;
+        bins[b] += w;
     }
+    
     int best_b = 0;
     for(int i=1; i<BINS; i++) if(bins[i] > bins[best_b]) best_b = i;
     out->mode_vol = sqrt(((double)best_b/BINS)*max_v + (0.5/BINS)*max_v);
     
-    // 4. RESAMPLE
-    if(1.0/sum_sq_weight < (N_PARTICLES * 0.5)) {
+    // --- E. RESAMPLE ---
+    if(1.0/sum_sq_weight < (N_PARTICLES * 0.6)) {
         Particle* new_s = malloc(N_PARTICLES * sizeof(Particle));
         double r = (next_rand()%10000)/10000.0 * (1.0/N_PARTICLES);
         double c_w = swarm[0].weight;
         int i=0;
+        
         for(int m=0; m<N_PARTICLES; m++) {
             double u = r + (double)m/N_PARTICLES;
             while(u > c_w && i < N_PARTICLES-1) { i++; c_w += swarm[i].weight; }
+            
             new_s[m] = swarm[i];
             new_s[m].weight = 1.0/N_PARTICLES;
             
-            new_s[m].v *= (0.99 + 0.02 * ((next_rand()%1000)/1000.0));
-            new_s[m].mu += 0.02 * rand_normal(); 
+            // Jitter dependent on entropy
+            // Low Entropy = Low Jitter (Trust the signal)
+            // High Entropy = High Jitter (Explore)
+            double jitter = (out->entropy < 0.5) ? 0.005 : 0.05;
+            
+            new_s[m].v *= (1.0 + jitter * rand_normal());
+            new_s[m].mu += jitter * rand_normal();
             new_s[m].rho = swarm[i].rho;
         }
         memcpy(swarm, new_s, N_PARTICLES * sizeof(Particle));
