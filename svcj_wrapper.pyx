@@ -23,22 +23,15 @@ cdef np.ndarray[double, ndim=2, mode='c'] _sanitize(object d):
     return np.ascontiguousarray(np.asarray(d, dtype=np.float64))
 
 def discover_regimes(object ohlcv, double dt, int n_states=3):
-    """
-    Runs the Baum-Welch algorithm to discover hidden market regimes.
-    """
     cdef np.ndarray[double, ndim=2, mode='c'] data = _sanitize(ohlcv)
     cdef int n_obs = data.shape[0]
     
-    # HMM Result container
     cdef HMMResult res
     
-    # Run C-Core (This can take a few seconds)
     with nogil:
         train_hmm(&data[0,0], n_obs, n_states, dt, &res)
         
-    # Unpack results into Python objects
     model = res.model
-    
     init = np.array(model.initial_probs[:n_states])
     trans = np.array(model.transitions)[:n_states, :n_states]
     means = np.array(model.means[:n_states])
@@ -46,7 +39,6 @@ def discover_regimes(object ohlcv, double dt, int n_states=3):
     
     path = np.array([res.viterbi_path[i] for i in range(n_obs - 1)])
     
-    # IMPORTANT: Free the memory allocated by C for the path
     free(res.viterbi_path)
     
     return {

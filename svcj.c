@@ -11,7 +11,6 @@ void compute_log_returns(double* ohlcv, int n_rows, double* out_returns) {
     }
 }
 
-// Gaussian PDF
 double gaussian_pdf(double x, double mean, double var) {
     if (var < 1e-12) var = 1e-12;
     double coeff = 1.0 / sqrt(2.0 * M_PI * var);
@@ -29,7 +28,6 @@ void train_hmm(double* ohlcv, int n_obs, int n_states, double dt, HMMResult* res
     HMMModel model;
     model.n_states = n_states;
     
-    // Uniform initial probs and transitions
     for(int i=0; i<n_states; i++) {
         model.initial_probs[i] = 1.0 / n_states;
         for(int j=0; j<n_states; j++) {
@@ -37,7 +35,6 @@ void train_hmm(double* ohlcv, int n_obs, int n_states, double dt, HMMResult* res
         }
     }
     
-    // Segmented initialization for means/variances
     int chunk_size = n_ret / n_states;
     for(int i=0; i<n_states; i++) {
         double sum = 0, sum_sq = 0;
@@ -51,20 +48,17 @@ void train_hmm(double* ohlcv, int n_obs, int n_states, double dt, HMMResult* res
         model.variances[i] = (sum_sq / chunk_size) - (model.means[i] * model.means[i]);
     }
     
-    // Allocate memory for Baum-Welch
     double* alpha = malloc(n_ret * n_states * sizeof(double));
     double* beta = malloc(n_ret * n_states * sizeof(double));
     double* gamma = malloc(n_ret * n_states * sizeof(double));
     double* xi = malloc(n_ret * n_states * n_states * sizeof(double));
-    double* scale = malloc(n_ret * sizeof(double)); // For numerical stability
+    double* scale = malloc(n_ret * sizeof(double));
     
-    // 2. Baum-Welch Iterations
     double old_log_lik = -DBL_MAX;
     
     for(int iter=0; iter<MAX_ITER; iter++) {
         // --- E-Step ---
-        
-        // A. Forward Pass (Alpha)
+        // Forward
         scale[0] = 0.0;
         for(int i=0; i<n_states; i++) {
             alpha[i] = model.initial_probs[i] * gaussian_pdf(returns[0], model.means[i], model.variances[i]);
@@ -87,7 +81,7 @@ void train_hmm(double* ohlcv, int n_obs, int n_states, double dt, HMMResult* res
             }
         }
         
-        // B. Backward Pass (Beta)
+        // Backward
         for(int i=0; i<n_states; i++) beta[(n_ret-1)*n_states + i] = 1.0;
         
         for(int t=n_ret-2; t>=0; t--) {
@@ -100,7 +94,7 @@ void train_hmm(double* ohlcv, int n_obs, int n_states, double dt, HMMResult* res
             }
         }
         
-        // C. Gamma and Xi
+        // Gamma and Xi
         for(int t=0; t<n_ret-1; t++) {
             double den = 0.0;
             for(int i=0; i<n_states; i++) den += alpha[t*n_states+i]*beta[t*n_states+i];
@@ -115,11 +109,8 @@ void train_hmm(double* ohlcv, int n_obs, int n_states, double dt, HMMResult* res
         }
         
         // --- M-Step ---
-        
-        // A. Re-estimate Initial Probs
         for(int i=0; i<n_states; i++) model.initial_probs[i] = gamma[i];
         
-        // B. Re-estimate Transitions
         for(int i=0; i<n_states; i++) {
             double den = 0.0;
             for(int t=0; t<n_ret-1; t++) den += gamma[t*n_states+i];
@@ -131,7 +122,6 @@ void train_hmm(double* ohlcv, int n_obs, int n_states, double dt, HMMResult* res
             }
         }
         
-        // C. Re-estimate Emissions (Means/Vars)
         for(int i=0; i<n_states; i++) {
             double gamma_sum=0, mean_num=0, var_num=0;
             for(int t=0; t<n_ret; t++) {
@@ -147,7 +137,6 @@ void train_hmm(double* ohlcv, int n_obs, int n_states, double dt, HMMResult* res
             model.variances[i] = var_num / gamma_sum;
         }
         
-        // Check for convergence
         double log_lik = 0;
         for(int t=0; t<n_ret; t++) log_lik += log(scale[t]);
         
@@ -155,7 +144,7 @@ void train_hmm(double* ohlcv, int n_obs, int n_states, double dt, HMMResult* res
         old_log_lik = log_lik;
     }
     
-    // 3. Viterbi Algorithm (Decoding)
+    // Viterbi
     int* viterbi_path = malloc(n_ret * sizeof(int));
     double* T1 = malloc(n_ret * n_states * sizeof(double));
     int* T2 = malloc(n_ret * n_states * sizeof(int));
@@ -170,10 +159,7 @@ void train_hmm(double* ohlcv, int n_obs, int n_states, double dt, HMMResult* res
             int max_idx = 0;
             for(int i=0; i<n_states; i++) {
                 double val = T1[(t-1)*n_states+i] + log(model.transitions[i][j]);
-                if (val > max_val) {
-                    max_val = val;
-                    max_idx = i;
-                }
+                if (val > max_val) { max_val = val; max_idx = i; }
             }
             T1[t*n_states+j] = max_val + log(gaussian_pdf(returns[t], model.means[j], model.variances[j]));
             T2[t*n_states+j] = max_idx;
@@ -183,16 +169,12 @@ void train_hmm(double* ohlcv, int n_obs, int n_states, double dt, HMMResult* res
     // Backtrack
     double max_prob = -DBL_MAX;
     for(int i=0; i<n_states; i++) {
-        if(T1[(n_ret-1)*n_states+i] > max_prob) {
-            max_prob = T1[(n_ret-1)*n_states+i];
-            viterbi_path[n_ret-1] = i;
-        }
+        if(T1[(n_ret-1)*n_states+i] > max_prob) { max_prob = T1[(n_ret-1)*n_states+i]; viterbi_path[n_ret-1] = i; }
     }
     for(int t=n_ret-2; t>=0; t--) {
         viterbi_path[t] = T2[(t+1)*n_states + viterbi_path[t+1]];
     }
     
-    // 4. Finalize
     result->model = model;
     result->viterbi_path = viterbi_path;
     
