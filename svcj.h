@@ -9,38 +9,30 @@
 
 #define N_PARTICLES 2000
 #define MIN_EFFECTIVE_PARTICLES 1000
-#define CHI_SQ_CUTOFF 16.0 
 
-// Dynamic Particle (Learns Physics)
+// Lean Particle (State Only)
 typedef struct {
-    double v;           // Variance
-    double mu;          // Drift
-    double theta;       // Dynamic Structural Vol
-    double kappa;       // Dynamic Mean Reversion
-    double rho;         // Correlation
-    double weight;      // Probability
-    double last_log_p;  // Memory
+    double v;
+    double mu;
+    double rho;
+    double weight;
+    double last_log_p;
 } Particle;
 
-// Multi-Scale Momentum Memory
 typedef struct {
-    double trend_fast;  // ~5 min
-    double trend_mid;   // ~15 min
-    double trend_slow;  // ~60 min
-    double coherence;   // Alignment score (-1 to 1)
+    double trend_fast;
+    double trend_mid;
+    double trend_slow;
+    double coherence;
 } TrendState;
 
-// Output
 typedef struct {
     double ev_vol;
     double mode_vol;
     double ev_drift;
     double entropy;
     int collapsed;
-    
-    // Debugging / Telematics
-    double global_trend_coherence;
-    double avg_theta; // Swarm's view of gravity
+    double trend_coherence;
 } SwarmState;
 
 typedef struct {
@@ -56,6 +48,7 @@ void init_swarm(PhysicsParams* phys, Particle* swarm, double start_price, TrendS
 void update_swarm(Particle* swarm, TrendState* ts, PhysicsParams* phys, 
                   double o, double h, double l, double c, 
                   double vol_ratio, double diurnal_factor, double dt, 
+                  double prev_entropy,
                   SwarmState* out);
 
 #endif
