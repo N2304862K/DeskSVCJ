@@ -10,24 +10,22 @@
 #define N_PARTICLES 2000
 #define MIN_EFFECTIVE_PARTICLES 1000
 
-// The Particle (Hypothesis)
 typedef struct {
     double v;           // Variance
-    double mu;          // Drift (Trend)
+    double mu;          // Drift
     double rho;         // Correlation
-    double weight;      // Likelihood
+    double weight;      // Probability
     double last_log_p;  // Memory
 } Particle;
 
-// The Consensus (Output)
 typedef struct {
-    double ev_vol;      // Mean Vol (Risk)
-    double mode_vol;    // Robust Vol (Signal)
-    double ev_drift;    // Expected Trend
-    double entropy;     // Confidence
+    double ev_vol;
+    double mode_vol;
+    double ev_drift;
+    double entropy;
+    int collapse_count; // Debug: Track if swarm died
 } SwarmState;
 
-// Physics Limits
 typedef struct {
     double kappa;
     double theta;

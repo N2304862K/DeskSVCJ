@@ -12,6 +12,7 @@ cdef extern from "svcj.h":
         double v, mu, rho, weight
     ctypedef struct SwarmState:
         double ev_vol, mode_vol, ev_drift, entropy
+        int collapse_count
         
     void init_swarm(PhysicsParams* phys, Particle* swarm, double start_price) nogil
     void update_swarm(Particle* swarm, PhysicsParams* phys, 
@@ -33,8 +34,7 @@ cdef class IntradaySwarm:
         self.phys.sigma_j = params.get('sigma_j', 0.05)
         
         self.dt_base = dt_base
-        self.swarm = <Particle*> malloc(2000 * sizeof(Particle)) # Match N_PARTICLES
-        
+        self.swarm = <Particle*> malloc(2000 * sizeof(Particle))
         init_swarm(&self.phys, self.swarm, start_price)
         
     def __dealloc__(self):
@@ -49,5 +49,6 @@ cdef class IntradaySwarm:
             "ev_vol": out.ev_vol,
             "mode_vol": out.mode_vol,
             "ev_drift": out.ev_drift,
-            "entropy": out.entropy
+            "entropy": out.entropy,
+            "collapsed": bool(out.collapse_count)
         }
