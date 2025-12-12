@@ -5,41 +5,52 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <stdint.h>
 
-#define N_PARTICLES 2000
-#define MIN_EFFECTIVE_PARTICLES 1000
-#define CHI_SQ_CUTOFF 9.0
+#define N_COLS 5
+#define N_REGIMES 3 // Bull, Bear, Crash
 
 typedef struct {
-    double v;
-    double mu;
-    double rho;
-    double weight;
-    double last_log_p;
-} Particle;
+    double mu, kappa, theta, sigma_v, rho, lambda_j, mu_j, sigma_j;
+} SVCJParams;
 
 typedef struct {
-    double ev_vol;
-    double mode_vol;
-    double ev_drift;
-    double entropy;
-    int collapsed;
-} SwarmState;
+    // Current State
+    double probabilities[N_REGIMES]; // P(Regime_i)
+    int most_likely_regime;          // Viterbi path output
+    
+    // Weighted Physics (For external use)
+    double expected_spot_vol;
+    double expected_lambda;
+} HMMState;
 
-typedef struct {
-    double kappa;
-    double theta;
-    double sigma_v;
-    double lambda_j;
-    double mu_j;
-    double sigma_j;
-} PhysicsParams;
+// Core Utils
+void compute_log_returns(double* ohlcv, int n_rows, double* out_returns);
 
-void init_swarm(PhysicsParams* phys, Particle* swarm, double start_price);
-void update_swarm(Particle* swarm, PhysicsParams* phys, 
-                  double o, double h, double l, double c, 
-                  double vol_ratio, double diurnal_factor, double momentum_bias, double dt, 
-                  SwarmState* out);
+// HMM Engine
+void run_hmm_forward_pass(
+    double return_val, 
+    double dt,
+    SVCJParams* params_array,         // Array of SVCJParams for each regime
+    double* transition_matrix,        // N_REGIMES x N_REGIMES
+    double* last_probs,               // Input Probabilities
+    double* out_probs,                // Output Probabilities
+    double* out_likelihoods          // Likelihood of data given each regime
+);
+
+void viterbi_decode(
+    int n_obs,
+    double* all_likelihoods,          // T x N_REGIMES matrix
+    double* transition_matrix,
+    double* initial_probs,
+    int* out_path                    // Most likely sequence of regimes
+);
+
+// Helper for pure likelihood calc
+double ukf_single_pass_likelihood(
+    double return_val, 
+    double dt, 
+    SVCJParams* p, 
+    double* state_var
+);
 
 #endif
